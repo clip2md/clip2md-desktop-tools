@@ -1,0 +1,31 @@
+name: Verify community market source
+
+on:
+  pull_request:
+  push:
+    branches: [main, 'codex/**']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      CLIP2MD_BUILD_CHANNEL: market
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run verify
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clipmd-desktop-tools-market
+          path: |
+            dist/main.js
+            dist/manifest.json
+            dist/styles.css
+          if-no-files-found: error
