@@ -171,4 +171,3 @@ export function decryptWechatChannelsMediaBuffer(
     result[index] ^= stream[index];
   return result;
 }
-

@@ -220,4 +220,3 @@ export function wechatChannelsFeedError(response: unknown): string | undefined {
   if (!wechatChannelsMediaCandidates(payload).length)
     return "视频号未返回可下载的音视频流";
 }
-

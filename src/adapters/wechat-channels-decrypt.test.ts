@@ -49,4 +49,3 @@ describe("WeChat Channels ISAAC64 head decryption", () => {
     expect(output[131_072]).toBe(input[131_072]);
   });
 });
-
