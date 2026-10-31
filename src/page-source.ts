@@ -90,8 +90,8 @@ export function snapshotPage(): RenderedSnapshot {
     try {
       const text = JSON.stringify(globals[name]);
       if (!text || text.length > 2 * 1024 * 1024) continue;
-      const node = document.createElement("script");
-      node.type = "application/json";
+      const node = document.createElement("div");
+      node.setAttribute("data-clip2md-state-type", "json");
       node.setAttribute("data-clip2md-live-state", name);
       node.textContent = text.replace(/</g, "\\u003c");
       clone.append(node);
@@ -103,8 +103,8 @@ export function snapshotPage(): RenderedSnapshot {
     try {
       const state = xhsNoteState();
       if (state !== undefined) {
-        const node = document.createElement("script");
-        node.type = "application/json";
+        const node = document.createElement("div");
+        node.setAttribute("data-clip2md-state-type", "json");
         node.setAttribute("data-clip2md-live-state", "xiaohongshu-note");
         node.textContent = JSON.stringify(state).replace(/</g, "\\u003c");
         clone.append(node);

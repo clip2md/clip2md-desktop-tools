@@ -85,6 +85,18 @@ export function publicPageStates(document: Document): unknown[] {
     "__NEXT_DATA__",
     "__INITIAL_DATA__",
   ]);
+  for (const node of Array.from(document.querySelectorAll<HTMLElement>("[data-clip2md-live-state]"))) {
+    const text = node.textContent || "";
+    if (!text || text.length > 2 * 1024 * 1024) continue;
+    try {
+      const value: unknown = JSON.parse(text);
+      if (node.getAttribute("data-clip2md-live-state") === "__pace_f") {
+        if (Array.isArray(value)) addPace(value);
+      } else states.push(value);
+    } catch {
+      /* Script-backed state is parsed below; malformed state is ignored. */
+    }
+  }
   for (const script of Array.from(document.scripts).slice(0, 128)) {
     const text = script.textContent || "";
     if (script.src || !text || text.length > 2 * 1024 * 1024) continue;

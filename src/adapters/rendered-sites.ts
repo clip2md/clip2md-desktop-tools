@@ -212,7 +212,7 @@ export function extractRenderedSitePage(
     return withSourceMetadata(result, metadata);
   };
   let selectedHtml = snapshot.html;
-  if (document.querySelector("script[data-clip2md-live-state]")) {
+  if (document.querySelector("[data-clip2md-live-state]")) {
     const live = document.documentElement.cloneNode(true) as HTMLElement;
     live
       .querySelectorAll("script:not([data-clip2md-live-state])")
