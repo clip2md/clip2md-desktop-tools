@@ -82,7 +82,7 @@ export function authenticatedPage(snapshot:RenderedSnapshot,requested:string):Si
         || /^(?:请登录|登录后查看|access denied|sign in to continue)[\s\S]{0,180}$/i.test(text))throw new Error('来源返回登录或验证页面，请重新登录');
     const platform=platformFor(requested);
     if (platform === 'wechat-channel') {
-        const stateNode = document.querySelector('script[data-clip2md-live-state="wechat-finder"]');
+        const stateNode = document.querySelector('[data-clip2md-live-state="wechat-finder"]');
         if (stateNode?.textContent) {
             try {
                 const state = JSON.parse(stateNode.textContent) as Record<string, any>;
