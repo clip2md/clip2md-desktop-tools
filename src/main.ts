@@ -1,3 +1,4 @@
+import { renderDependency } from './plugin-dependency';
 import { PlatformSettingsView } from "./platform-settings";
 import { readAccountProfile, type AccountProfile } from "./account-profile";
 import { observeLogin, type LoginObserver, type LoggedInProfile } from "./login-observer";
@@ -11,7 +12,7 @@ import { TOOL_LABELS, toolsRoot, agentRepairInstructions, type ToolId, type Tool
 import { runTool } from "./tools";
 import { pendingUpdate } from "./update-gate";
 import { PersistentConfig, deviceId, record, directories, replaceStaged } from "./persistent-config";
-import { LocalLogger, pluginInstallation } from "./local-diagnostics";
+import { LocalLogger } from "./local-diagnostics";
 import { DiagnosticsUI } from "./diagnostics-ui";
 import { BUILD_CHANNEL } from "./build-channel";
 import { cleanupAuthorizationFiles } from "./cookie-file";
@@ -172,6 +173,7 @@ export default class DesktopTools extends Plugin {
         await this.retainedConfig?.save(shared);
         this.app.saveLocalStorage(`clip2md-tools-${device}`, { ffmpeg, ytdlp, whisper, whisperModel, language, asrTimeoutMinutes });
         await this.saveData(shared);
+        this.refreshSettingsViews();
     }
     async onExternalSettingsChange(): Promise<void> {
         const raw: unknown = await this.loadData();
@@ -184,22 +186,10 @@ export default class DesktopTools extends Plugin {
         await this.savePreferences();
     }
     private async dependencyGuide(): Promise<void> {
-        const state = await pluginInstallation(this.app.vault.adapter, this.app.vault.configDir, "clipmd");
         const modal = new Modal(this.app);
-        modal.titleEl.setText("需要 Clip2MD 主插件");
-        modal.contentEl.createEl("p", {
-            text: state.installed
-                ? "请在设置 → 社区插件中启用 Clip2MD 主插件。已启用时请检查两个插件版本、绑定状态和更新事务状态。"
-                : "桌面扩展需要主插件完成云端绑定、同步与笔记写入。请先安装并启用主插件。",
-        });
-        modal.contentEl.createEl("a", {
-            text: BUILD_CHANNEL === "market"
-                ? "打开主插件社区页面"
-                : "下载网站组合包与安装说明",
-            href: BUILD_CHANNEL === "market"
-                ? "obsidian://show-plugin?id=clipmd"
-                : "https://clip2.md/app/sync",
-        });
+        modal.titleEl.setText("本地剪藏扩展");
+        const cleanup = renderDependency(modal.contentEl, this.app, 'clipmd', () => ({ connected: !!this.bridge, compatible: !this.status.includes('协议不兼容'), bound: !!this.scope }));
+        modal.onClose = cleanup;
         modal.open();
     }
     declare settings: DesktopSettings;
@@ -224,6 +214,20 @@ export default class DesktopTools extends Plugin {
     private status = "等待 Clip2MD 主插件";
     private statusElements = new Set<HTMLElement>();
     private settingsViews = new Map<HTMLElement, () => void>();
+    private viewRefreshPending = false;
+    private dependencySignature = '';
+    private refreshSettingsViews(): void {
+        if (this.viewRefreshPending || !this.settingsViews.size) return;
+        this.viewRefreshPending = true;
+        window.setTimeout(() => {
+            this.viewRefreshPending = false;
+            if (!this.alive) return;
+            for (const container of [...this.settingsViews.keys()]) {
+                if (container.isConnected) this.renderSettings(container);
+                else this.settingsViews.get(container)?.();
+            }
+        }, 0);
+    }
     private profileViews = new Set<PlatformSettingsView>();
     private generation = 0;
     private attaching: Promise<void> = Promise.resolve();
@@ -343,7 +347,7 @@ export default class DesktopTools extends Plugin {
             this.active?.abort();
             this.bridge = null;
             this.scope = "";
-            for(const cleanup of this.settingsViews.values())cleanup();
+            this.refreshSettingsViews();
             void this.sessions.setScope("");
             this.updateStatus("主插件已停用或绑定变化，素材处理暂停");
         }));
@@ -351,7 +355,7 @@ export default class DesktopTools extends Plugin {
             this.addSettingTab(new DesktopSettingsTab(this.app, this));
         this.addCommand({
             id: "open-desktop-tools",
-            name: "打开本地素材与授权",
+            name: "打开本地剪藏扩展",
             callback: () => this.openSettings(),
         });
         this.addCommand({
@@ -474,6 +478,8 @@ export default class DesktopTools extends Plugin {
     }
     private updateStatus(message: string): void {
         this.status = message;
+        const signature = `${!!this.bridge}:${!!this.scope}:${this.manuallyEnabled}:${message.includes('协议不兼容')}`;
+        if (signature !== this.dependencySignature) { this.dependencySignature = signature; this.refreshSettingsViews(); }
         if (!this.alive)
             return;
         for (const el of this.statusElements) {
@@ -493,7 +499,7 @@ export default class DesktopTools extends Plugin {
                 cancelLocalRetry: () => { if (this.preparing) this.active?.abort(); },
                 readyFeatures: !this.manuallyEnabled || !this.bridge || !this.scope ? [] : this.asrReady && this.asrFingerprint === this.toolFingerprint() ? ["metadata", "transcription", "local-retry"] : ["metadata", "local-retry"],
                 setEnabled: (enabled: boolean) => this.setEnabled(enabled),
-                renderSettings: (container: HTMLElement) => this.renderSettings(container, false),
+                renderSettings: (container: HTMLElement) => this.renderSettings(container),
                 prepareTemplateValues: (context: LocalRetryContext, names: string[]) => this.prepareTemplateValues(context, names),
                 prepareLocalRetry: (context: LocalRetryContext) => this.prepareLocalRetry(context),
                 capabilities: ["update-pause-v1", "desktop-control-v1", "local-retry-v1", "local-template-v1"],
@@ -675,7 +681,7 @@ export default class DesktopTools extends Plugin {
         this.app.saveLocalStorage("clip2md-desktop-enabled-v1", enabled);
         if (!enabled) {
             this.setupController?.abort();
-            for(const cleanup of this.settingsViews.values())cleanup();
+            this.refreshSettingsViews();
             this.generation++;
             this.active?.abort();
             this.templateController?.abort();
@@ -908,7 +914,7 @@ export default class DesktopTools extends Plugin {
         if (!this.alive || generation !== this.generation)
             return;
         const scope = await bridge.bindingScope?.() || tasks.find(isTaskContext)?.bindingScope || "";
-        if(this.scope!==scope)for(const cleanup of this.settingsViews.values())cleanup();
+        if(this.scope!==scope)this.refreshSettingsViews();
         await this.sessions.setScope(scope);
         if (generation !== this.generation)
             return;
@@ -1705,6 +1711,12 @@ export default class DesktopTools extends Plugin {
             }
             container.scrollTop = scroll;
         };
+        const dependencyCleanup = BUILD_CHANNEL === 'market'
+            ? renderDependency(runtimeRoot, this.app, 'clipmd', () => ({ connected: !!this.bridge, compatible: !this.status.includes('协议不兼容'), bound: !!this.scope }))
+            : () => {};
+        runtimeRoot.createEl('p', { text: '在本机补充原站正文、媒体、评论和字幕；在 Web 端开启自动本地解析后，会回传提取或转写的文本用于云端生成笔记，并按账号规则使用额度。' });
+        runtimeRoot.createEl('a', { text: '隐私政策', href: 'https://clip2.md/privacy' });
+        runtimeRoot.createEl('a', { text: '查看本地自动处理记录', href: 'obsidian://clipmd-local-records' });
         let accountCleanup: (() => void) | undefined;
         if (standalone) {
             const accountBar = runtimeRoot.createDiv({ cls: 'clip2md-desktop-account-bar' });
@@ -1722,7 +1734,7 @@ export default class DesktopTools extends Plugin {
             });
         }
         if (standalone)
-            new Setting(runtimeRoot).setName("启用本地剪藏扩展").setDesc('首次开启会准备本地工具；关闭后停止任务，保留配置和素材。').addToggle(t => t.setValue(this.manuallyEnabled).onChange(async (enabled) => {
+            new Setting(runtimeRoot).setName("启用本地剪藏扩展").setDesc(BUILD_CHANNEL === 'website' ? '首次开启会自动准备本地工具；关闭后停止任务，保留配置和素材。' : '检查用户已安装的本地工具；关闭后停止任务，保留配置和素材。').addToggle(t => t.setValue(this.manuallyEnabled).onChange(async (enabled) => {
                 if (!this.bridge?.setDesktopEnabled) {
                     new Notice("请先安装并启用兼容的主插件");
                     this.renderSettings(container);
@@ -1731,15 +1743,20 @@ export default class DesktopTools extends Plugin {
                 await this.bridge.setDesktopEnabled(enabled);
                 this.renderSettings(container);
             })).settingEl.classList.add('clip2md-desktop-primary-setting');
-        const restoreDisabled = () => { restoreView(); if (this.settingsViews.get(container) === cleanup) this.settingsViews.delete(container); };
-        const cleanup = () => { accountCleanup?.(); if (this.settingsViews.get(container) === cleanup) this.settingsViews.delete(container); };
+        const restoreDisabled = () => { restoreView(); };
+        const cleanup = () => { dependencyCleanup(); accountCleanup?.(); if (this.settingsViews.get(container) === cleanup) this.settingsViews.delete(container); };
         this.settingsViews.set(container, cleanup);
         if (!this.manuallyEnabled) {
             const overview = runtimeRoot.createDiv({ cls: 'clip2md-desktop-overview clip2md-desktop-disabled-overview' });
             overview.createEl('strong', { text: '本地剪藏未开启' });
             overview.createEl('p', { text: '开启后按平台配置补充正文、媒体、评论和字幕。首次使用需准备本地工具。' });
+            this.diagnostics?.render(runtimeRoot, async () => {
+                this.configurationCleared = true;
+                await this.retainedConfig?.clear();
+                await this.saveData({});
+            });
             restoreDisabled();
-            return cleanup;
+            return () => this.settingsViews.get(container)?.();
         }
         const runtimeStatus = runtimeRoot.createDiv({ cls: "clip2md-desktop-overview" });
         runtimeStatus.createEl("strong", { text: this.manuallyEnabled ? "本地剪藏已开启" : "本地剪藏未开启" });
@@ -1914,7 +1931,7 @@ export default class DesktopTools extends Plugin {
         const enabledCleanup=()=>{cleanup();toolsCleanup();platforms.dispose();this.profileViews.delete(platforms);this.statusElements.delete(status);};
         this.settingsViews.set(container,enabledCleanup);
         restoreView();
-        return enabledCleanup;
+        return () => this.settingsViews.get(container)?.();
     }
 
     private shouldAutoObserveLogin(platform: LoginPlatform): boolean {
