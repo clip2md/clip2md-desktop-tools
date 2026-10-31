@@ -1,0 +1,9 @@
+{
+  "id": "clipmd-desktop-tools",
+  "name": "Clip2MD Desktop Tools",
+  "version": "0.2.1",
+  "minAppVersion": "1.13.1",
+  "description": "为剪藏笔记补充来源元信息、视频、字幕、图片与评论，素材保存至当前知识库.",
+  "author": "clip2md",
+  "isDesktopOnly": true
+}
