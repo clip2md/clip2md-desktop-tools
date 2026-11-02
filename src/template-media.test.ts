@@ -28,10 +28,11 @@ describe('body media template collection', () => {
         await expect(p['collectTemplateValues']({...context,sourceUrl},['local_author'],new AbortController().signal)).rejects.toThrow('完成原站登录');
         expect(collectMock).not.toHaveBeenCalled();
     });
-    it('requires a configured generic domain before collecting its fields',async()=>{
+    it('collects public generic fields without a configured domain or login',async()=>{
         const p=fixture();
-        await expect(p['collectTemplateValues']({...context,sourceUrl:'https://example.com/private'},['local_author'],new AbortController().signal)).rejects.toThrow('添加该域名');
-        expect(collectMock).not.toHaveBeenCalled();
+        await p['collectTemplateValues']({...context,sourceUrl:'https://example.com/article'},['local_author'],new AbortController().signal);
+        expect(collectMock).toHaveBeenCalledWith(expect.objectContaining({sourceUrl:'https://example.com/article'}),'metadata',expect.anything(),expect.anything(),expect.anything(),expect.anything(),expect.anything());
+        expect(profileMock).not.toHaveBeenCalled();
     });
     it('does not put an article fallback into the playable-media field',async()=>{
         const p=fixture();collectMock.mockResolvedValue({properties:{},assets:['资料/正文.md'],body:'正文图文'});

@@ -384,11 +384,11 @@ describe("public WeChat article extraction", () => {
 });
 
 // Authored layout contract; the live HTTP scenario separately verifies the public page.
-describe("Python Insider article metadata", () => {
+describe("generic Defuddle metadata (including Python Insider)", () => {
   const url = "https://blog.python.org/2025/10/sample-post/";
   const page = (header: string) =>
     `<html><title>文章原题 | Python Insider</title><article><header>${header}</header><p>${"文章正文保留原始内容与顺序。".repeat(20)}</p><img src="/image.webp"></article></html>`;
-  it("uses the explicit original title, author, publication date and source tags", () => {
+  it("uses Defuddle title and publication date without legacy site metadata", () => {
     const result = extractWebPage(
       page(
         '<h1>文章原题</h1><a href="/authors/original">原作者</a><time datetime="2025-10-07T00:00:00Z">发布日期</time><span>Updated <time datetime="2026-10-18T00:00:00Z">更新日</time></span><a href="/tags/releases">releases</a><a href="/tags/releases">releases</a>',
@@ -397,10 +397,7 @@ describe("Python Insider article metadata", () => {
     );
     expect(result).toMatchObject({
       title: "文章原题",
-      author: "原作者",
-      source: "Python Insider",
       source_date: "2025-10-07",
-      tags: ["releases"],
     });
     expect(result.markdown).toContain("https://blog.python.org/image.webp");
   });
@@ -413,30 +410,12 @@ describe("Python Insider article metadata", () => {
     );
     expect(result.author).toBeUndefined();
     expect(result.source_date).toBeUndefined();
-    expect(result.tags).toEqual([]);
-    expect(
-      extractWebPage(
-        page(
-          '<h1>文章原题</h1><span>Updated <time datetime="2026-10-18">仅更新日</time></span>',
-        ),
-        url,
-      ).source_date,
-    ).toBeUndefined();
+    expect(result.tags).toBeUndefined();
+
   });
-  it("rejects index/profile pages and changed article shells without treating another host as the site", () => {
-    expect(() =>
-      extractWebPage(
-        page("<h1>文章列表</h1>"),
-        "https://blog.python.org/tags/releases/",
-      ),
-    ).toThrow("具体文章");
-    expect(() => extractWebPage(page(""), url)).toThrow("文章标题");
-    expect(
-      extractWebPage(
-        page("<h1>文章原题</h1>"),
-        "https://blog.python.org.evil.example/2025/10/sample/",
-      ).source,
-    ).not.toBe("Python Insider");
+  it('does not impose the previous Python-specific page layout',()=>{
+    expect(extractWebPage(page(''),url).markdown).toContain('文章正文保留');
+    expect(extractWebPage(page('<h1>文章原题</h1>'),'https://blog.python.org.evil.example/2025/10/sample/').source).toBeUndefined();
   });
 });
 

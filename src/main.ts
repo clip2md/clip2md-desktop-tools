@@ -36,6 +36,7 @@ const labels: Record<Feature, string> = {
     comments: "评论",
     subtitles: "字幕与本地转写",
     images: "封面／原图",
+    files: "文件附件",
 };
 function localFailureReason(error: unknown): string {
     const text = error instanceof Error ? error.message : typeof error === "string" ? error : "";
@@ -576,14 +577,15 @@ export default class DesktopTools extends Plugin {
         const resolved=await this.bridge.resolveTask?.(context.taskId);
         const c: TaskContext = { ...context, contentVersion: context.revision, notePath: resolved?.notePath || [context.targetFolder ?? 'Clip2MD',`${context.taskId}.md`].filter(Boolean).join('/'), daily: false };
         const values: Record<string, string | number | string[]> = { ...(cached || {}) };
-        for (const feature of ["metadata", "images", "video", "comments"] as const) {
+        for (const feature of ["metadata", "images", "video", "comments", "files"] as const) {
             const materialNames = ['local_assets', 'local_cover', 'local_media', 'local_gallery'];
             const needed = feature === "metadata"
                 ? names.some(name => !name.startsWith("local_transcript") && name !== "local_transcribed_at" && !materialNames.includes(name))
                 : names.includes('local_assets') || (feature === 'images' && names.some(name => name === 'local_cover' || name === 'local_gallery'))
                     || (feature === 'video' && names.includes('local_media'));
-            if (needed && this.settings.platforms[platformFor(context.sourceUrl)][feature]) {
+            if (needed && supportsFeature(platformFor(context.sourceUrl),feature) && this.settings.platforms[platformFor(context.sourceUrl)][feature]) {
                 const result = await collect(c, feature, this.settings, this.sessions, this.store, signal, message => this.updateStatus(message));
+                if(result.failures?.length)throw new Error(`部分素材保存失败：${result.failures.join('；')}`);
                 for (const [name, value] of Object.entries(result.properties))
                     if (value !== undefined)
                         values[`local_${name}`] = value;
@@ -601,7 +603,6 @@ export default class DesktopTools extends Plugin {
     }
     private async requirePlatformLogin(sourceUrl:string,signal:AbortSignal):Promise<void> {
         const platform=loginFor(sourceUrl,this.settings.webDomains);
-        if(platform.startsWith('web:') && !this.settings.webDomains.includes(platform.slice(4)))throw new AuthorizationRequired('请先在通用网页中添加该域名并完成登录');
         // Generic web pages are often public. Probe them anonymously and
         // request authorization only if the rendered page is actually a
         // login or access-challenge page.
@@ -805,13 +806,18 @@ export default class DesktopTools extends Plugin {
             const resolved=await this.bridge.resolveTask?.(request.taskId);
             if(resolved)context.notePath=resolved.notePath;
             await this.requirePlatformLogin(request.sourceUrl,controller.signal);
-            const result = await resolveSource(context, this.sessions, controller.signal);
+            const result = await resolveSource(context, this.sessions, controller.signal,platformFor(request.sourceUrl)==='zsxq' && this.settings.platforms.zsxq.subtitles?'subtitles':undefined);
             let markdown = result.content.markdown, provenance = result.content.transcription_source || "source-page";
-            if(platformFor(request.sourceUrl)==='web') {
+            if(platformFor(request.sourceUrl)==='zsxq' && this.settings.platforms.zsxq.subtitles && result.mediaItems?.length) {
+                const captured=await collect(context,'subtitles',this.settings,this.sessions,this.store,controller.signal,message=>this.updateStatus(message));
+                if(captured.failures?.length)throw new Error(`部分字幕／转写失败：${captured.failures.join('；')}`);
+                markdown=captured.body;provenance='zsxq-independent-media';
+            }
+            else if(['web', 'zsxq', 'taobao'].includes(platformFor(request.sourceUrl))) {
                 const article=await saveArticle(context,result,this.settings,this.store,controller.signal);
                 markdown=article.markdown;
-                provenance='authenticated-web-page';
-                if(this.settings.platforms.web.video && (result.media || result.detectedMedia)) {
+                provenance=platformFor(request.sourceUrl)==='taobao'?'authenticated-taobao-page':platformFor(request.sourceUrl)==='zsxq'?'authenticated-zsxq-page':'authenticated-web-page';
+                if(platformFor(request.sourceUrl)==='web' && this.settings.platforms.web.video && (result.media || result.detectedMedia)) {
                     const captured=await collect(context,'video',this.settings,this.sessions,this.store,controller.signal,()=>{});
                     markdown+='\n\n'+captured.body;
                 }
@@ -941,6 +947,19 @@ export default class DesktopTools extends Plugin {
         }
         let changed = false;
         for (const platform of platforms) {
+            if (platform === 'taobao' && this.state.jobs.some(job => job.status === 'waiting-auth' && job.context.bindingScope === this.scope && platformFor(job.context.sourceUrl) === 'taobao' && job.authPrompted)) continue;
+            if (platform.startsWith('web:')) {
+                // Legacy waiting jobs may only have failed the old domain-list
+                // prerequisite. Re-probe the page before opening a login window.
+                for (const job of this.state.jobs)
+                    if (job.status === 'waiting-auth' && job.context.bindingScope === this.scope &&
+                        loginFor(job.context.sourceUrl, this.settings.webDomains) === platform && !job.authPrompted) {
+                        job.status = 'queued';
+                        job.message = '重新检查正文是否需要登录';
+                        changed = true;
+                    }
+                continue;
+            }
             // YouTube and X are authorized from the user's Chrome profile.
             // Check that bridge after reconnecting as well; otherwise a task
             // that was paused before an Obsidian restart would never resume
@@ -1093,11 +1112,17 @@ export default class DesktopTools extends Plugin {
                 try { return loginFor(job.context.sourceUrl, this.settings?.webDomains || []) === platform; }
                 catch { return false; }
             });
-            // Only ordinary WeChat articles need the source page as their login
-            // document. Dedicated account applications must keep their own
+            // Generic sites and ordinary WeChat articles use the source page
+            // as their login document. Dedicated account applications keep their own
             // login routes; opening a protected content URL can return JSON or
             // start the wrong consumer/broadcaster flow.
-            const targetUrl = platform === "wechat" ? waiting?.context.sourceUrl : undefined;
+            const targetUrl = platform === "wechat" || platform === 'taobao' || platform.startsWith('web:') ? waiting?.context.sourceUrl : undefined;
+            if (platform === 'taobao' || platform.startsWith('web:')) {
+                for (const job of this.state.jobs)
+                    if (['queued','waiting-auth'].includes(job.status) && job.context.bindingScope === this.scope && loginFor(job.context.sourceUrl, this.settings.webDomains) === platform)
+                        job.authPrompted = true;
+                this.persist();
+            }
             const login = await this.login(platform, targetUrl);
             if (login === false)
                 this.disableQueuedPlatform(platform);
@@ -1106,6 +1131,7 @@ export default class DesktopTools extends Plugin {
         }
     }
     private disableQueuedPlatform(platform: LoginPlatform): void {
+        if (platform === 'taobao' || platform.startsWith('web:')) return;
         const platformName = (platform.startsWith("web:") ? "web" : platform) as PlatformName;
         this.settings.platformEnabled[platformName] = false;
         for (const view of this.profileViews) view.expired(platform);
@@ -1190,6 +1216,12 @@ export default class DesktopTools extends Plugin {
             const job = this.state.jobs.find((j) => j.status === "queued" && j.context.bindingScope === this.scope && (!j.nextAttemptAt || j.nextAttemptAt <= Date.now()));
             if (!job)
                 return;
+            if (platformFor(job.context.sourceUrl) === 'web' && !supportsFeature('web', job.feature)) {
+                job.status = 'cancelled';
+                job.message = '通用网页已改为正文图文提取，停止旧的额外采集任务';
+                this.persist();
+                continue;
+            }
             const operation = crypto.randomUUID();
             const controller = new AbortController();
             this.active = controller;
@@ -1225,7 +1257,7 @@ export default class DesktopTools extends Plugin {
                     if (JSON.stringify(checked) !== JSON.stringify(saved.files))
                         throw new Error("已保存素材被修改或损坏，已保留原文件，未自动覆盖");
                 }
-                else {
+                if(!saved || saved.failures?.length) {
                     await this.requirePlatformLogin(context.sourceUrl,controller.signal);
                     if(job.feature==="subtitles" && this.settings.whisper)await this.assertASRReady();
                     // Reuse material produced by an earlier feature in the same task.
@@ -1258,7 +1290,7 @@ export default class DesktopTools extends Plugin {
                             .filter((file) =>
                                 canReuseAsset(file, previousContentVersion))
                         : [];
-                    const result = await collect(context, job.feature, this.settings, this.sessions, this.store, controller.signal, (message) => this.updateStatus(`${labels[job.feature]} · ${message}`), [...new Set([...priorAssets, ...cachedAssets])]);
+                    const result = await collect(context, job.feature, this.settings, this.sessions, this.store, controller.signal, (message) => this.updateStatus(`${labels[job.feature]} · ${message}`), [...new Set([...priorAssets, ...cachedAssets, ...(saved?.assets||[])])]);
                     controller.signal.throwIfAborted();
                     if (generation !== this.generation || !this.bridge)
                         throw new Error("主插件绑定已变化");
@@ -1273,6 +1305,7 @@ export default class DesktopTools extends Plugin {
                     const assets = [...result.assets, supplement];
                     saved = {
                         properties: result.properties,
+                        ...(result.failures?.length?{failures:result.failures}:{}),
                         assets,
                         files: await this.store.manifest(result.assets, controller.signal),
                     };
@@ -1319,6 +1352,7 @@ export default class DesktopTools extends Plugin {
                         ...previous,
                         ...Object.fromEntries(Object.entries(incoming).filter(([k]) => !applied.preserved.includes(k as never))),
                     };
+                    if(saved.failures?.length)throw new Error(`部分资源未完成（${saved.failures.length} 项）：${saved.failures.join('；')}`);
                     job.status = "complete";
                     job.replaceUserValues = false;
                     job.message = applied.preserved.length
@@ -1364,8 +1398,10 @@ export default class DesktopTools extends Plugin {
                 if (job.status === "waiting-auth" && (platform === "youtube" || platform === "twitter")) {
                     void this.promptWaitingAuthJobs();
                 }
-                const suppressPrompt = (this.authRetrySuppressedUntil.get(platform) || 0) > Date.now();
-                if (job.status === "waiting-auth" && !this.authNotified.has(platform) && !suppressPrompt) {
+                const generic = platform.startsWith('web:');
+                const suppressPrompt = generic || platform === 'taobao' ? job.authPrompted === true
+                    : (this.authRetrySuppressedUntil.get(platform) || 0) > Date.now();
+                if (job.status === "waiting-auth" && (generic || !this.authNotified.has(platform)) && !suppressPrompt) {
                     this.authNotified.add(platform);
                     new Notice(`${platform.startsWith('web:')?platform.slice(4):LOCAL_PLATFORM_LABELS[platform as keyof typeof LOCAL_PLATFORM_LABELS]} 需要原站授权。已打开登录窗口，完成后会自动恢复任务。`, 10000);
                     // Keep the failed job paused while the user completes the
@@ -1457,7 +1493,15 @@ export default class DesktopTools extends Plugin {
             modal.open();
         }).open();
     }
-    private async login(platform: LoginPlatform, targetUrl?: string): Promise<AccountProfile | false> {
+    private loginWork = new Map<LoginPlatform, Promise<AccountProfile | false>>();
+    private login(platform: LoginPlatform, targetUrl?: string): Promise<AccountProfile | false> {
+        const existing=this.loginWork.get(platform);
+        if(existing)return existing;
+        const work=this.performLogin(platform,targetUrl).finally(()=>{if(this.loginWork.get(platform)===work)this.loginWork.delete(platform);});
+        this.loginWork.set(platform,work);
+        return work;
+    }
+    private async performLogin(platform: LoginPlatform, targetUrl?: string): Promise<AccountProfile | false> {
         if (!this.bridge || !this.manuallyEnabled || !this.scope || this.updatePaused || this.bridge.updatePaused?.()) {
             new Notice("请先启用并绑定主插件，或等待更新完成");
             return false;
@@ -1511,15 +1555,20 @@ export default class DesktopTools extends Plugin {
                 const save = async (detected?: LoggedInProfile) => {
                     if (saving || saved || closed) return;
                     saving = true;
+                    const generic = platform.startsWith('web:');
+                    let rollbackAuthorization: (() => void) | undefined;
+                    let registeringDomain = false;
+                    const resumedJobs: Job[] = [];
                     try {
                         if (!this.alive || !this.manuallyEnabled || this.scope !== expectedScope) throw new Error('主插件绑定或启用状态已变化，请重新授权');
+                        if (generic) rollbackAuthorization = this.sessions.authorizationCheckpoint(platform);
                         if (platform === 'twitter' || platform === 'youtube') await this.sessions.authorizedCookies(platform, controller.signal);
                         // Only a stable first-party login cookie or the user's
                         // explicit generic-site confirmation may authorize a
                         // non-observed platform. This is also the path used by
                         // Weibo's SUB/SUBP polling, so waiting jobs can resume.
                         if(!observedAccount(platform)) {
-                            const confirmed = !!detected || platform === 'lizhi' || platform.startsWith('web:');
+                            const confirmed = !!detected || platform === 'lizhi' || platform === 'taobao' || platform.startsWith('web:');
                             await this.sessions.save(platform, controller.signal, win, confirmed);
                         }
                         // Cookie polling has already confirmed a stable
@@ -1546,14 +1595,34 @@ export default class DesktopTools extends Plugin {
                         );
                         controller.signal.throwIfAborted();
                         if (this.scope !== expectedScope) return;
+                        if (generic && !this.settings.webDomains.includes(platform.slice(4))) {
+                            registeringDomain = true;
+                            this.settings.webDomains.push(platform.slice(4));
+                            await this.savePreferences();
+                            controller.signal.throwIfAborted();
+                            if (this.scope !== expectedScope) throw new Error('主插件绑定已变化，请重新授权');
+                        }
                         this.authNotified.delete(platform);
                         this.authRetrySuppressedUntil.set(platform, Date.now() + 120_000);
                         for (const job of this.state.jobs)
-                            if (job.status === "waiting-auth" && job.context.bindingScope === this.scope && loginFor(job.context.sourceUrl,this.settings.webDomains) === platform) job.status = "queued";
+                            if (job.status === "waiting-auth" && job.context.bindingScope === this.scope && loginFor(job.context.sourceUrl,this.settings.webDomains) === platform) {
+                                resumedJobs.push(job);
+                                job.status = "queued";
+                                if (generic || platform === 'taobao') job.authPrompted = true;
+                            }
                         this.persist(); saved = profile;
                         this.logger?.log('auth.saved', { platform:diagnosticPlatform, source: detected ? 'network' : 'manual-check' });
                         modal.close(); this.drain();
                     } catch (error) {
+                        if (generic && this.scope === expectedScope) {
+                            for (const job of resumedJobs) job.status = 'waiting-auth';
+                            try { rollbackAuthorization?.(); } catch { /* Keep jobs paused if SecretStorage itself is unavailable. */ }
+                            if (registeringDomain) {
+                                this.settings.webDomains = this.settings.webDomains.filter(domain => domain !== platform.slice(4));
+                                this.sessions.setWebDomains(this.settings.webDomains);
+                                await this.savePreferences().catch(() => undefined);
+                            }
+                        }
                         if (!controller.signal.aborted && !closed) {
                             this.logger?.log('auth.save.failed', { platform:diagnosticPlatform }, 'warn');
                             new Notice(error instanceof Error ? error.message : '授权保存失败，请检查原站登录状态');
@@ -1572,7 +1641,7 @@ export default class DesktopTools extends Plugin {
                 };
                 modal.open(); win.show?.(); win.focus?.();
                 if (observer) void observer.profile.then(profile => { if (profile && !closed) return save(profile); });
-                if (['csdn', 'douban', 'weibo', 'toutiao', 'youtube', 'twitter', 'kuaishou', 'xiaoyuzhou', 'lizhi', 'applepodcasts', 'wechat-channel'].includes(platform)) {
+                if (['csdn', 'douban', 'weibo', 'toutiao', 'youtube', 'twitter', 'kuaishou', 'xiaoyuzhou', 'lizhi', 'applepodcasts', 'wechat-channel', 'taobao'].includes(platform)) {
                     const checkCookies = async () => {
                         const current = ++cookieCheck;
                         try {
@@ -1822,7 +1891,7 @@ export default class DesktopTools extends Plugin {
                     this.persist();
                 }
             },
-            login:platform=>this.login(platform),
+            login:(platform,targetUrl)=>this.login(platform,targetUrl),
             revoke:async platform=>{await this.sessions.revoke(platform);this.active?.abort();this.logger?.log("auth.revoked",{platform});},
             profile:(platform,signal)=>readAccountProfile(this.sessions,platform,signal),
             importFavorites: this.bridge?.submitFavoriteLinks ? platform => this.openFavoriteImport(platform) : undefined,
@@ -1875,6 +1944,7 @@ export default class DesktopTools extends Plugin {
                         job.retryCount = 0;
                         delete job.nextAttemptAt;
                         delete job.lastError;
+                        delete job.authPrompted;
                         this.persist();
                         this.drain();
                         this.renderSettings(container);

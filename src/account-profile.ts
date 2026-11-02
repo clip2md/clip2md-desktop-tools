@@ -1,6 +1,8 @@
 /** Account inspection for settings and before capture. No polling or nickname persistence. */
 import type { SiteSessions } from './auth';
 import { loginOrigin, observedAccount, type LoginPlatform } from './config';
+import { parseZsxqResponse } from './adapters/zsxq';
+import { hasTaobaoLogin } from './taobao-session';
 export type AccountProfile = { state:'authenticated'; nickname:string; sessionOnly?:boolean } | {state:'missing'|'expired'|'unknown'};
 interface ProfileWebContents {
     debugger: {attach(version:string):void;detach():void;on(name:string,callback:(event:unknown,method:string,params:{requestId:string;response?:{url:string;status:number}})=>void):void;sendCommand(method:string,params?:Record<string,unknown>):Promise<unknown>};
@@ -23,6 +25,11 @@ function yuanbaoProfile(payload:unknown):AccountProfile {
 /** Accept only explicitly authenticated responses from the platform's own self endpoint. */
 export function profileFromResponse(platform:LoginPlatform,payload:unknown):AccountProfile {
     if(platform==='wechat-channel')return yuanbaoProfile(payload);
+    if(platform==='zsxq') {
+        const root=object(payload),user=object(object(root.resp_data).user),name=nickname(user.name);
+        if(root.code===401)return {state:'expired'};
+        return root.succeeded===true && identity(user.uid ?? user.user_id) && name ? {state:'authenticated',nickname:name}:{state:'unknown'};
+    }
     const root=object(payload),data=object(root.data);
     if(platform==='bilibili') {
         if(root.code===-101 || data.isLogin===false)return {state:'expired'};
@@ -50,6 +57,7 @@ export function selfEndpoint(platform:LoginPlatform,value:string):boolean {
         const url=new URL(value);
         if(url.protocol!=='https:'||url.username||url.password)return false;
         if(platform==='wechat-channel')return url.hostname==='yuanbao.tencent.com' && url.pathname==='/api/getuserinfo';
+        if(platform==='zsxq')return url.hostname==='api.zsxq.com' && /^\/v3\/users\/self$/.test(url.pathname);
         if(platform==='bilibili')return url.hostname==='api.bilibili.com' && url.pathname==='/x/web-interface/nav';
         if(platform==='douyin')return url.hostname==='www.douyin.com' && url.pathname==='/aweme/v1/web/user/profile/self/';
         if(platform==='zhihu')return url.hostname==='www.zhihu.com' && url.pathname==='/api/v4/me';
@@ -112,6 +120,9 @@ export async function readAccountProfile(sessions:SiteSessions,platform:LoginPla
     signal.throwIfAborted();
     if(!observedAccount(platform)) {
         const stored = sessions.hasStoredAuthorization(platform);
+        if (platform === 'taobao') return stored && hasTaobaoLogin(cookies)
+            ? {state:'authenticated', nickname:'淘宝/天猫', sessionOnly:true}
+            : {state:stored?'expired':'missing'};
         const validCookies = cookies.filter(c => !!c.value && (!c.expirationDate || c.expirationDate > Date.now()/1000));
         const valid = platform === 'wechat-channel'
             ? sessions.hasLocalStorageAuthorization(platform)
@@ -123,12 +134,13 @@ export async function readAccountProfile(sessions:SiteSessions,platform:LoginPla
                     ? validCookies.some(c => loginCookies[platform]!.includes(c.name)) || sessions.hasLocalStorageAuthorization(platform)
                     : validCookies.length > 0 || sessions.hasLocalStorageAuthorization(platform);
         if (!((stored || platform === 'youtube' || platform === 'twitter') && valid)) return {state:stored?'expired':'missing'};
+        if (platform.startsWith('web:')) return {state:'authenticated',nickname:platform.slice(4),sessionOnly:true};
         const name=cookieNickname(platform,validCookies)
             || (typeof (sessions as unknown as {open?:unknown}).open === 'function'
                 ? await renderedNickname(sessions,platform,signal) : '');
         return {state:'authenticated',nickname:name||new URL(loginOrigin(platform)).hostname,sessionOnly:true};
     }
-    if(platform!=='wechat-channel' && !cookies.some(c=>loginCookies[platform]?.includes(c.name) && c.value && (!c.expirationDate || c.expirationDate>Date.now()/1000)))return {state:sessions.hasStoredAuthorization(platform)?'expired':'missing'};
+    if(platform!=='wechat-channel' && platform!=='zsxq' && !cookies.some(c=>loginCookies[platform]?.includes(c.name) && c.value && (!c.expirationDate || c.expirationDate>Date.now()/1000)))return {state:sessions.hasStoredAuthorization(platform)?'expired':'missing'};
     const open = (sessions as unknown as {open?:SiteSessions['open']}).open;
     if(typeof open!=='function')return {state:sessions.hasStoredAuthorization(platform)?'unknown':'missing'};
     const win=await open.call(sessions,platform,false);
@@ -153,7 +165,7 @@ export async function readAccountProfile(sessions:SiteSessions,platform:LoginPla
                 void (async()=>{
                     const body=await web.debugger.sendCommand('Network.getResponseBody',{requestId:params.requestId}) as {body?:string;base64Encoded?:boolean};
                     if(signal.aborted||done||typeof body.body!=='string'||body.body.length>256*1024||body.base64Encoded)return;
-                    const profile=profileFromResponse(platform,JSON.parse(body.body));
+                    const profile=profileFromResponse(platform,platform==='zsxq'?parseZsxqResponse(body.body):JSON.parse(body.body));
                     if(profile.state!=='unknown')complete(profile);
                     else if(platform==='wechat-channel')complete(profile);
                 })().catch(()=>undefined);

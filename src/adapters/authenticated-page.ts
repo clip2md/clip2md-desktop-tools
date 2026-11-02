@@ -1,6 +1,8 @@
 /** Normalize a signed-in rendered page. Generic pages intentionally omit site metrics and comments. */
 import { Readability } from '@mozilla/readability';
 import { htmlToMarkdown } from './extract';
+import { defuddlePage } from './defuddle-page';
+import { zsxqPage } from './zsxq';
 import { platformFor, type PlatformName } from '../config';
 import type { RenderedSnapshot } from './rendered-sites';
 import { siteAccessRequired, sourceMetrics, type SiteResult } from './sites';
@@ -10,6 +12,7 @@ import {
     wechatChannelsFeedError,
     wechatChannelsMediaCandidates,
 } from './wechat-channels';
+import { taobaoPage } from './taobao';
 
 const articleSelectors: Partial<Record<PlatformName,string>> = {
     csdn:'#content_views', zhihu:'.RichContent-inner .RichText, .Post-RichTextContainer',
@@ -75,6 +78,9 @@ function zhihuAnswerMetadata(document:Document, requested:string):{author?:strin
     return {author:cleanAuthor(author,'zhihu'),sourceDate:sourceDay(value('dateCreated')||value('dateModified')),metrics};
 }
 export function authenticatedPage(snapshot:RenderedSnapshot,requested:string):SiteResult {
+    if (platformFor(requested) === 'web') return { content: defuddlePage(snapshot) };
+    if (platformFor(requested) === 'zsxq') return zsxqPage(snapshot,requested);
+    if (platformFor(requested) === 'taobao') return taobaoPage(snapshot, requested);
     const document=new DOMParser().parseFromString(snapshot.html,'text/html');
     const text=document.body.textContent?.replace(/\s+/g,' ').trim()||'';
     if(siteAccessRequired(snapshot.html)||/\/(?:login|signin|passport|sso)(?:\/|$)/i.test(new URL(snapshot.url).pathname)

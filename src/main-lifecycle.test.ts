@@ -309,3 +309,20 @@ describe('closing an incomplete login',()=>{
   expect(instance['persist']).toHaveBeenCalledOnce();
  });
 });
+
+describe('Knowledge Planet partial resource queue',()=>{
+ it('publishes successes but remains retryable, then recollects failed resources instead of trusting saved partial state',async()=>{
+  const instance=new DesktopTools(),scope='1'.repeat(64);
+  const context={bindingScope:scope,taskId:88,sourceUrl:'https://wx.zsxq.com/topic/123',contentVersion:'1',notePath:'Notes/88.md',daily:false};
+  const job={key:'zsxq-files',context,feature:'files',status:'queued',message:'等待',attempts:0};
+  const applyMetadata=vi.fn(async()=>({status:'applied',preserved:[]}));
+  Object.assign(instance,{alive:true,manuallyEnabled:true,scope,generation:0,bridge:{resolveTask:vi.fn(async()=>context),applyMetadata},settings:normalizeSettings({}),state:{version:1,jobs:[job],properties:{}},persist:vi.fn(),logger:{log:vi.fn()},requirePlatformLogin:vi.fn(async()=>{}),store:{localFile:vi.fn(async()=>'/vault/document.pdf'),manifest:vi.fn(async(paths:string[])=>paths.map(path=>({path,sha256:'a'.repeat(64)}))),supplement:vi.fn(async()=> '资料/补充.md')},sessions:{}});
+  mocks.collect.mockReset();mocks.collect.mockResolvedValueOnce({properties:{},assets:['资料/成功.pdf'],body:'文件2下载失败',failures:['文件2：HTTP 500']});
+  await instance['runQueue']();
+  expect(job.status).toBe('queued');expect(job.saved?.failures).toEqual(['文件2：HTTP 500']);expect(job.saved?.assets).toContain('资料/成功.pdf');expect(applyMetadata).toHaveBeenCalledOnce();
+  job.nextAttemptAt=0;
+  mocks.collect.mockResolvedValueOnce({properties:{},assets:['资料/成功.pdf','资料/文件2.pdf'],body:'全部附件'});
+  await instance['runQueue']();
+  expect(mocks.collect).toHaveBeenCalledTimes(2);expect(mocks.collect.mock.calls[1][7]).toContain('资料/成功.pdf');expect(job.status).toBe('complete');expect(job.saved?.failures).toBeUndefined();
+ });
+});

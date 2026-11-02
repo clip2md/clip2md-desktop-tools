@@ -1,6 +1,6 @@
 export const PLATFORMS = [
     "bilibili", "douyin", "xiaohongshu", "csdn", "zhihu", "douban",
-    "wechat", "wechat-channel", "weibo", "youtube", "twitter", "kuaishou", "toutiao", "xiaoyuzhou", "lizhi", "applepodcasts", "web",
+    "wechat", "wechat-channel", "weibo", "youtube", "twitter", "kuaishou", "toutiao", "xiaoyuzhou", "lizhi", "applepodcasts", "zsxq", "taobao", "web",
 ] as const;
 export type PlatformName = (typeof PLATFORMS)[number];
 export const FEATURES = [
@@ -10,6 +10,7 @@ export const FEATURES = [
     "comments",
     "subtitles",
     "images",
+    "files",
 ] as const;
 export type Feature = (typeof FEATURES)[number];
 export interface DesktopSettings {
@@ -33,7 +34,8 @@ export function normalizeSettings(raw: unknown): DesktopSettings {
     return {
         platforms: Object.fromEntries(PLATFORMS.map((p) => [
             p,
-            Object.fromEntries(FEATURES.map((f) => [f, v.platforms?.[p]?.[f] === true])),
+            Object.fromEntries(FEATURES.map((f) => [f, (f!=='files' || p==='zsxq') && (!['web', 'taobao'].includes(p) || supportsFeature(p, f)) &&
+                (typeof v.platforms?.[p]?.[f] === 'boolean' ? v.platforms[p][f] : p === 'web')])),
         ])) as DesktopSettings["platforms"],
         platformEnabled: Object.fromEntries(PLATFORMS.map(p => [p,
             typeof v.platformEnabled?.[p] === "boolean" ? v.platformEnabled[p] : FEATURES.some(f => v.platforms?.[p]?.[f] === true),
@@ -52,7 +54,8 @@ export function normalizeSettings(raw: unknown): DesktopSettings {
     };
 }
 export function platformFor(value: string): PlatformName {
-    const host = new URL(value).hostname.toLowerCase();
+    const parsed = new URL(value);
+    const host = parsed.hostname.toLowerCase();
     const match = (domain: string) => host === domain || host.endsWith("." + domain);
     for (const [domain, platform] of [
         ['csdn.net', 'csdn'], ['zhihu.com', 'zhihu'], ['douban.com', 'douban'],
@@ -60,6 +63,7 @@ export function platformFor(value: string): PlatformName {
         ['x.com', 'twitter'], ['twitter.com', 'twitter'], ['t.co', 'twitter'],
         ['kuaishou.com', 'kuaishou'], ['kwai.com', 'kuaishou'], ['toutiao.com', 'toutiao'], ['toutiaoimg.cn', 'toutiao'],
         ['lizhi.fm', 'lizhi'], ['podcasts.apple.com', 'applepodcasts'], ['itunes.apple.com', 'applepodcasts'],
+        ['zsxq.com','zsxq'],
     ] as const) if (match(domain)) return platform;
     if (match("bilibili.com") || match("b23.tv"))
         return "bilibili";
@@ -76,6 +80,8 @@ export function platformFor(value: string): PlatformName {
     if (host === "weixin.qq.com") return "wechat";
     if (match("xiaoyuzhoufm.com"))
         return "xiaoyuzhou";
+    if ((match("taobao.com") || match("tmall.com") || ['e.tb.cn', 'm.tb.cn'].includes(host)) && parsed.protocol === 'https:' && !parsed.username && !parsed.password && !parsed.port)
+        return "taobao";
     return "web";
 }
 export const LOGIN_ORIGINS = {
@@ -98,6 +104,7 @@ export const LOGIN_ORIGINS = {
     // Use Lizhi's consumer taco login flow. The standalone page that previously
     // opened here started the broadcaster login instead of the listener login.
     lizhi: 'https://nj.lizhi.fm/static/login/#/taco/redirect', applepodcasts: 'https://podcasts.apple.com/',
+    zsxq: 'https://wx.zsxq.com/', taobao: 'https://www.taobao.com/',
 } as const;
 export type LoginPlatform = keyof typeof LOGIN_ORIGINS | `web:${string}`;
 export const LOGIN_DOMAINS: Record<keyof typeof LOGIN_ORIGINS, string[]> = {
@@ -117,7 +124,21 @@ export const LOGIN_DOMAINS: Record<keyof typeof LOGIN_ORIGINS, string[]> = {
     // Apple ID auth hands off through music.apple.com and writes the Music
     // media token as a shared apple.com cookie.
     applepodcasts: ['podcasts.apple.com', 'itunes.apple.com', 'apple.com'],
+    zsxq: ['zsxq.com'],
+    taobao: ['taobao.com', 'tmall.com', 'e.tb.cn', 'm.tb.cn'],
 };
+/** Only desktop product detail routes have a stable product identity in v1. */
+export function taobaoItemId(value: string): string | undefined {
+    try {
+        const url = new URL(value);
+        const hosts = ['item.taobao.com', 'detail.tmall.com'];
+        const ids = url.searchParams.getAll('id');
+        if (url.protocol !== 'https:' || url.username || url.password || url.port || url.pathname !== '/item.htm'
+            || !hosts.some(host => url.hostname === host || url.hostname.endsWith('.' + host))
+            || ids.length !== 1 || !/^[1-9]\d{0,29}$/.test(ids[0])) return;
+        return ids[0];
+    } catch { return; }
+}
 /** A generic site is scoped to the explicitly configured hostname and its subdomains. */
 export function normalizeWebDomain(value: string): string {
     try {
@@ -148,13 +169,16 @@ export function loginDomains(platform: LoginPlatform): string[] {
     return platform.startsWith('web:') ? [new URL(loginOrigin(platform)).hostname] : LOGIN_DOMAINS[platform as keyof typeof LOGIN_ORIGINS];
 }
 export function supportsFeature(platform: PlatformName, feature: Feature): boolean {
-    if (platform === 'web') return !['comments', 'subtitles'].includes(feature);
+    if (platform === 'web') return ['metadata', 'article', 'images'].includes(feature);
+    if (feature === 'files') return platform === 'zsxq';
+    if (platform === 'zsxq') return true;
     if (platform === 'wechat-channel') return feature !== 'comments';
     if (platform === 'lizhi' || platform === 'applepodcasts') return feature !== 'comments';
+    if (platform === 'taobao') return ['metadata', 'article', 'images'].includes(feature);
     return true;
 }
 export function observedAccount(platform: LoginPlatform): boolean {
-    return ['bilibili', 'douyin', 'xiaohongshu', 'zhihu', 'wechat-channel'].includes(platform);
+    return ['bilibili', 'douyin', 'xiaohongshu', 'zhihu', 'wechat-channel','zsxq'].includes(platform);
 }
 /** Validate externally edited settings before normalization can replace a user preference with defaults. */
 export function validPreferences(value: unknown): boolean {

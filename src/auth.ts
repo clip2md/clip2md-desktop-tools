@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { setTimeout, clearTimeout } from 'node:timers';
 import { isPublicAddress, lookupWithSignal } from "./adapters/network";
 import { loginFor, loginOrigin, loginDomains, observedAccount, type LoginPlatform } from "./config";
+import { hasTaobaoLogin } from './taobao-session';
 import type { AccountProfile } from "./account-profile";
 // Structural boundary: electron.remote is supplied by some Obsidian desktop hosts.
 // No remote package or browser runtime is installed if the host lacks it.
@@ -152,6 +153,7 @@ const AUTH_COOKIE_NAMES: Partial<Record<LoginPlatform, string[]>> = {
   xiaohongshu: ["web_session"],
   zhihu: ["z_c0"],
   weibo: ["SUB", "SUBP"],
+  taobao: ['cookie2', 'unb'],
 };
 function authFingerprint(cookies: SiteCookie[], platform: LoginPlatform): string {
   const names = AUTH_COOKIE_NAMES[platform] || [];
@@ -298,6 +300,16 @@ export class SiteSessions {
       return false;
     }
   }
+  private cookieScopeUrl(platform: LoginPlatform, cookie: SiteCookie): string | undefined {
+    const host = cookie.domain.replace(/^\./, '');
+    const url = `https://${host}${cookie.path || '/'}`;
+    if (this.allowed(platform, url)) return url;
+    // A parent-domain Cookie can authenticate a configured subdomain without
+    // granting permission to navigate to the parent or sibling domains.
+    if (platform.startsWith('web:') && cookie.domain.startsWith('.') && host.includes('.') &&
+        platform.slice(4).endsWith('.' + host))
+      return `https://${platform.slice(4)}${cookie.path || '/'}`;
+  }
   private async session(platform: LoginPlatform): Promise<SiteSession> {
     await this.transitions;
     const expectedScope = this.scope;
@@ -352,12 +364,9 @@ export class SiteSessions {
         const cookies = this.savedState(platform).cookies;
         if (!Array.isArray(cookies) || cookies.length > 200) throw new Error();
         for (const cookie of cookies) {
-          const url =
-            "https://" +
-            cookie.domain.replace(/^\./, "") +
-            (cookie.path || "/");
+          const url = this.cookieScopeUrl(platform, cookie);
           if (
-            this.allowed(platform, url) &&
+            url &&
             (!cookie.expirationDate ||
               cookie.expirationDate > Date.now() / 1000)
           )
@@ -396,6 +405,12 @@ export class SiteSessions {
   hasStoredAuthorization(platform: LoginPlatform): boolean {
     return !!this.scope && !!this.app.secretStorage.getSecret(this.secret(platform));
   }
+  /** Roll back only persisted credentials; keep the interactive window usable for another save attempt. */
+  authorizationCheckpoint(platform: LoginPlatform): () => void {
+    const scope = this.scope, key = this.secret(platform);
+    const previous = this.app.secretStorage.getSecret(key) || '';
+    return () => { if (this.scope === scope) this.app.secretStorage.setSecret(key, previous); };
+  }
   async authorizedCookies(platform: LoginPlatform, signal?: AbortSignal): Promise<SiteCookie[]> {
     const browserAllowed = (platform === "youtube" || platform === "twitter") && !!this.browserCookieProvider;
     if (
@@ -421,9 +436,7 @@ export class SiteSessions {
       }
       cookies = [...cookies, ...browser];
     }
-    return cookies.filter((c) =>
-      this.allowed(platform, "https://" + c.domain.replace(/^\./, "") + "/"),
-    );
+    return cookies.filter(c => !!this.cookieScopeUrl(platform, c));
   }
   /**
    * Detect the small set of first-party login cookies whose names and paired
@@ -432,6 +445,8 @@ export class SiteSessions {
    */
   async cookieLoginProfile(platform: LoginPlatform, win?: SiteWindow): Promise<Extract<AccountProfile, { state: "authenticated" }> | undefined> {
     const cookies = await this.authorizedCookies(platform);
+    if (platform === 'taobao' && hasTaobaoLogin(cookies))
+      return { state: 'authenticated', nickname: '淘宝/天猫', sessionOnly: true };
     const valid = (name: string) => cookies.some(cookie =>
       cookie.name === name && !!cookie.value &&
       (!cookie.expirationDate || cookie.expirationDate > Date.now() / 1000));
@@ -560,9 +575,7 @@ export class SiteSessions {
     signal?.throwIfAborted();
     const expectedScope = this.scope;
     const secret = this.secret(platform);
-    const cookies = (await this.cookies(platform)).filter((c) =>
-      this.allowed(platform, "https://" + c.domain.replace(/^\./, "") + "/"),
-    );
+    const cookies = (await this.cookies(platform)).filter(c => !!this.cookieScopeUrl(platform, c));
     const names: Partial<Record<LoginPlatform, string[]>> = {
       bilibili: ["SESSDATA"],
       douyin: ["sessionid", "sessionid_ss"],
@@ -581,8 +594,10 @@ export class SiteSessions {
     // stop writing the old yb_user_id keys while /api/getuserinfo stays valid.
     // Only pass the profile returned by readAccountProfile here; the generic
     // confirmed flag still cannot authorize an observed platform.
-    const apiVerified = platform === "wechat-channel" && !!verifiedProfile;
-    const authorized = apiVerified || (platform === "lizhi"
+    const apiVerified = (platform === "wechat-channel" || platform==='zsxq') && !!verifiedProfile;
+    const authorized = apiVerified || (platform === 'taobao'
+      ? confirmed && hasTaobaoLogin(validCookies)
+      : platform === "lizhi"
       ? validCookies.some(cookie => cookie.name === "lztacokefu") ||
         storages.some(storageAuthenticatesLizhi)
       : platform === "wechat-channel"

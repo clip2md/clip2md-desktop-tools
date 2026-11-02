@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { FEATURES, PLATFORMS, LOGIN_ORIGINS, loginDomains, loginFor, loginOrigin, normalizeSettings, normalizeWebDomain, platformFor, supportsFeature, validPreferences } from './config';
+import { taobaoItemId, FEATURES, PLATFORMS, LOGIN_ORIGINS, loginDomains, loginFor, loginOrigin, normalizeSettings, normalizeWebDomain, platformFor, supportsFeature, validPreferences } from './config';
 
 describe('platforms and domain-scoped authorization', () => {
     it.each([
@@ -11,6 +11,8 @@ describe('platforms and domain-scoped authorization', () => {
         ['https://weixin.qq.com/sph/AEnuRCNZHg','wechat-channel'],['https://channels.weixin.qq.com/finder-preview/pages/sph?id=AEnuRCNZHg','wechat-channel'],
         ['https://v.douyin.com/abc','douyin'],['https://xhslink.cn/abc','xiaohongshu'],
         ['https://www.lizhi.fm/123/1','lizhi'], ['https://podcasts.apple.com/us/podcast/test/id123?i=456','applepodcasts'],
+        ['https://item.taobao.com/item.htm?id=123456789','taobao'], ['https://detail.tmall.com/item.htm?id=123456789','taobao'],
+        ['https://chaoshi.detail.tmall.com/item.htm?id=123456789','taobao'],
     ])('recognizes %s as %s', (url, platform) => expect(platformFor(url)).toBe(platform));
     it('provides the same feature fields and a login origin for every named platform', () => {
         const settings=normalizeSettings({platforms:{bilibili:{metadata:true}}});
@@ -43,6 +45,15 @@ describe('platforms and domain-scoped authorization', () => {
         expect(loginOrigin('lizhi')).toBe('https://nj.lizhi.fm/static/login/#/taco/redirect');
         expect(loginDomains('lizhi')).toContain('lizhifm.com');
     });
+    it('uses one local login scope for Taobao and Tmall detail pages',()=>{
+        expect(loginFor('https://item.taobao.com/item.htm?id=123456789')).toBe('taobao');
+        expect(loginFor('https://detail.tmall.com/item.htm?id=123456789')).toBe('taobao');
+        expect(loginOrigin('taobao')).toBe('https://www.taobao.com/');
+        expect(loginDomains('taobao')).toContain('taobao.com');
+        expect(loginDomains('taobao')).toContain('tmall.com');
+        expect(supportsFeature('taobao', 'article')).toBe(true);
+        expect(supportsFeature('taobao', 'comments')).toBe(false);
+    });
     it('allows the first-party login and token domains for Kuaishou and Apple Podcasts',()=>{
         expect(loginOrigin('kuaishou')).toBe('https://passport.kuaishou.com/pc/account/login');
         expect(loginDomains('kuaishou')).toContain('passport.kuaishou.com');
@@ -61,5 +72,32 @@ describe('platforms and domain-scoped authorization', () => {
         expect(validPreferences({webDomains:['example.com']})).toBe(true);
         expect(validPreferences({webDomains:['http://example.com']})).toBe(false);
         expect(validPreferences({webDomains:'example.com'})).toBe(false);
+    });
+});
+
+describe('Taobao product boundaries', () => {
+    it.each([
+        'http://item.taobao.com/item.htm?id=123',
+        'https://item.taobao.com.evil.test/item.htm?id=123',
+        'https://detail.tmall.com@evil.test/item.htm?id=123',
+        'https://attacker@item.taobao.com/item.htm?id=123',
+        'https://item.taobao.com:444/item.htm?id=123',
+        'https://taobao.com./item.htm?id=123',
+    ])('does not identify an unsafe URL as Taobao: %s', url => {
+        expect(platformFor(url)).toBe('web');
+        expect(taobaoItemId(url)).toBeUndefined();
+    });
+    it.each([
+        'https://item.taobao.com/item.htm',
+        'https://item.taobao.com/item.htm?id=NaN',
+        'https://item.taobao.com/item.htm?id=123&id=456',
+        'https://www.taobao.com/?id=123',
+        'https://s.taobao.com/search?id=123',
+        'not a URL',
+    ])('rejects unsupported or ambiguous product routes: %s', url => expect(taobaoItemId(url)).toBeUndefined());
+    it('retains the product identity and keeps unsupported capabilities disabled after settings reload', () => {
+        expect(taobaoItemId('https://chaoshi.detail.tmall.com/item.htm?id=123&skuId=456')).toBe('123');
+        const settings = normalizeSettings({platforms:{taobao:{video:true,comments:true,subtitles:true,article:true}}});
+        expect(settings.platforms.taobao).toMatchObject({article:true, video:false, comments:false, subtitles:false});
     });
 });

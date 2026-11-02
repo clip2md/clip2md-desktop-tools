@@ -2,7 +2,7 @@ import { Notice, Setting } from 'obsidian';
 import { LOCAL_PLATFORM_LABELS, type FavoritePlatform } from './companion-protocol';
 import { FEATURES, PLATFORMS, platformFor, normalizeWebDomain, supportsFeature, type DesktopSettings, type LoginPlatform, type PlatformName } from './config';
 import type { AccountProfile } from './account-profile';
-const labels={metadata:'补充来源属性',article:'正文图文',video:'视频／音频',comments:'评论',subtitles:'字幕与本地转写',images:'封面／原图'};
+const labels={metadata:'补充来源属性',article:'正文图文',video:'视频／音频',comments:'评论',subtitles:'字幕与本地转写',images:'封面／原图',files:'文件附件'};
 interface Options {
     settings:DesktopSettings;
     available:()=>boolean;
@@ -10,7 +10,7 @@ interface Options {
     save:()=>Promise<void>;
     enableProperties?:()=>Promise<void>;
     platformChanged:(platform:PlatformName,enabled:boolean)=>void;
-    login:(platform:LoginPlatform)=>Promise<boolean | AccountProfile>;
+    login:(platform:LoginPlatform,targetUrl?:string)=>Promise<boolean | AccountProfile>;
     revoke:(platform:LoginPlatform)=>Promise<void>;
     profile:(platform:LoginPlatform,signal:AbortSignal)=>Promise<AccountProfile>;
     importFavorites?:(platform:FavoritePlatform)=>void;
@@ -34,7 +34,7 @@ export class PlatformSettingsView {
     }
     private canUse(platform:PlatformName):boolean {
         const authenticated = platform === 'web'
-            ? this.options.settings.webDomains.length > 0
+            ? true
             : this.authenticated.has(platform);
         return this.alive && this.options.available() && this.options.settings.platformEnabled[platform] && authenticated;
     }
@@ -45,20 +45,23 @@ export class PlatformSettingsView {
         this.root.replaceChildren();this.render();
     }
     private domainEditor(panel:HTMLElement):void {
-        panel.createEl('p',{text:'添加 HTTPS 网址或域名；公开页面直接采集，仅在需要时请求原站授权。',cls:'setting-item-description'});
+        panel.createEl('p',{text:'公开网页无需添加域名或登录。正文被登录拦截时会打开原站窗口；也可在此添加域名并保存本机登录态。',cls:'setting-item-description'});
         const editor=panel.createDiv({cls:'clip2md-local-domain-editor'});
         const input=editor.createEl('input',{attr:{type:'url',placeholder:'https://example.com','aria-label':'通用网页域名'}});
-        const add=editor.createEl('button',{text:'添加域名'});add.type='button';
+        const add=editor.createEl('button',{text:'添加并登录'});add.type='button';
         add.disabled=!this.options.available();
         add.addEventListener('click',()=>{void (async()=>{
+            if(add.disabled)return;
             const domain=normalizeWebDomain(input.value);
             if(!domain){new Notice('请输入有效的 HTTPS 网址或域名');return;}
             if(platformFor(`https://${domain}/`)!=='web'){new Notice('该站点已有定制配置，请使用对应平台卡片登录');return;}
-            if(this.options.settings.webDomains.includes(domain)){new Notice('该域名已添加；公开页面可直接采集，受保护的页面会单独提示登录');return;}
-            const before=[...this.options.settings.webDomains],scope=this.options.scope();
-            this.options.settings.webDomains.push(domain);add.disabled=true;
-            try{await this.options.save();if(this.alive&&scope===this.options.scope()){this.rerender();void this.refresh(`web:${domain}`,true);}}
-            catch{this.options.settings.webDomains=before;new Notice('域名保存失败，请重试');}
+            const scope=this.options.scope();add.disabled=true;
+            try {
+                const target=new URL(input.value.includes('://')?input.value:`https://${input.value}`).href;
+                const saved=await this.options.login(`web:${domain}`,target);
+                if(!this.alive||scope!==this.options.scope())return;
+                if(saved)this.rerender();
+            } catch { if(this.alive)new Notice('登录态或域名保存失败，请重试'); }
             finally{if(this.alive)add.disabled=!this.options.available();}
         })();});
     }
@@ -84,7 +87,9 @@ export class PlatformSettingsView {
                 const before=this.options.settings.platformEnabled[platform];
                 const beforeFlags={...this.options.settings.platforms[platform]};
                 this.options.settings.platformEnabled[platform]=value;
-                try{await this.options.save();}
+                if(platform==='web'&&value&&!Object.values(beforeFlags).some(Boolean))
+                    Object.assign(this.options.settings.platforms.web,{metadata:true,article:true,images:true});
+                try{if(platform==='web'&&value&&this.options.settings.platforms.web.metadata)await this.options.enableProperties?.();await this.options.save();}
                 catch{this.options.settings.platformEnabled[platform]=before;Object.assign(this.options.settings.platforms[platform],beforeFlags);toggle.setValue(before);return;}
                 panel.hidden=!value;
                 const keys:LoginPlatform[]=platform==='web'?this.options.settings.webDomains.map(domain=>`web:${domain}` as const):[platform];
@@ -99,13 +104,13 @@ export class PlatformSettingsView {
             }));
             const featureUpdates:Array<()=>void>=[];
             this.featureUpdates.set(platform,featureUpdates);
-            panel.createEl('p',{text:'登录后才能启用采集能力；开启来源属性时会同步更新笔记属性模板。',cls:'setting-item-description clip2md-local-feature-guide'});
+            panel.createEl('p',{text:platform==='web'?'使用 Defuddle 保存正文图文及基础信息；公开页面无需登录。':'登录后才能启用采集能力；开启来源属性时会同步更新笔记属性模板。',cls:'setting-item-description clip2md-local-feature-guide'});
             for(const feature of FEATURES) {
                 if(!supportsFeature(platform,feature))continue;
-                const setting=new Setting(panel).setName(labels[feature]);
-                if(feature==='article')setting.setDesc('保存正文及其本地图片');
+                const setting=new Setting(panel).setName(platform==='web'&&feature==='metadata'?'基础来源属性':platform==='web'&&feature==='images'?'正文图片':labels[feature]);
+                if(feature==='article')setting.setDesc(platform==='taobao'?'保存商品价格、店铺、当前规格、参数和详情图文；价格以本次页面显示为准':'保存正文及其本地图片');
                 if(feature==='video')setting.setDesc('保存页面中探测到的音视频');
-                if(feature==='metadata')setting.setDesc('补充标题、作者、发布时间和互动数据');
+                if(feature==='metadata')setting.setDesc(platform==='taobao'?'保存商品标题和来源；商品信息写入 Markdown 正文':platform==='web'?'保存 Defuddle 提取的标题、作者和发布时间':'补充标题、作者、发布时间和互动数据');
                 if(feature==='subtitles')setting.setDesc('优先原站字幕，无字幕时本地转写');
                 setting.addToggle(toggle=>{
                     featureUpdates.push(()=>{toggle.setValue(this.options.settings.platforms[platform][feature]).setDisabled(!this.canUse(platform)||!supportsFeature(platform,feature));});
@@ -143,7 +148,7 @@ export class PlatformSettingsView {
                     .addButton(button=>button.setButtonText('撤销授权').setDisabled(!this.options.available()).onClick(()=>{
                         this.controllers.get(p)?.abort();
                         this.authenticated.delete(p);this.loginAttempts.delete(p);this.updateFeatures(p);
-                        void this.options.revoke(p).then(()=>{if(this.alive)this.setStatus(p,'已撤销授权，请重新登录。功能已锁定。','expired');}).catch(()=>{if(this.alive)this.setStatus(p,'撤销失败，请重试。功能已锁定。','error');});
+                        void this.options.revoke(p).then(()=>{if(this.alive)this.setStatus(p,p.startsWith('web:')?'未保存登录态；公开页面仍可直接剪藏。':'已撤销授权，请重新登录。功能已锁定。','expired');}).catch(()=>{if(this.alive)this.setStatus(p,'撤销失败，请重试。功能已锁定。','error');});
                     }));
             if(platform==='web')new Setting(accountPanel).addButton(button=>button.setButtonText('移除此域名').setDisabled(!this.options.available()).onClick(()=>{void (async()=>{
                     const before=[...this.options.settings.webDomains];
@@ -161,7 +166,7 @@ export class PlatformSettingsView {
         const flags=this.options.settings.platforms[this.base(platform)];
         const before={...flags};
         for(const feature of FEATURES)
-            if(supportsFeature(this.base(platform),feature)) flags[feature]=true;
+            if(!['web','zsxq'].includes(this.base(platform))&&supportsFeature(this.base(platform),feature)) flags[feature]=true;
         const hasChanged=FEATURES.some(feature=>flags[feature]!==before[feature]);
         if(hasChanged) {
             try{await this.options.enableProperties?.();await this.options.save();}
@@ -171,7 +176,7 @@ export class PlatformSettingsView {
         if(scope!==this.options.scope()){this.authenticated.delete(platform);this.updateFeatures(platform);return;}
         if(!this.canUse(this.base(platform)))return;
         const label=platform.startsWith('web:')?platform.slice(4):LOCAL_PLATFORM_LABELS[this.base(platform)];
-        this.setStatus(platform,profile.sessionOnly?`${label} · 已登录：${profile.nickname}（本机登录态）`:`已登录：${profile.nickname}`,'authenticated');
+        this.setStatus(platform,platform.startsWith('web:')?`${label} · 已保存本机登录态`:profile.sessionOnly?`${label} · 已登录：${profile.nickname}（本机登录态）`:`已登录：${profile.nickname}`,'authenticated');
         this.updateFeatures(platform);
     }
     private async login(platform:LoginPlatform):Promise<void> {
@@ -185,12 +190,13 @@ export class PlatformSettingsView {
             if(!this.alive||this.loginAttempts.get(platform)!==attempt||scope!==this.options.scope()||!this.options.available()||!this.expanded.has(platform))return;
             if(typeof saved==='object'&&saved.state==='authenticated')await this.unlock(platform,saved);
             else if(saved===true){this.loginAttempts.delete(platform);await this.refresh(platform);}
-            else { this.setStatus(platform,'登录尚未完成，平台已关闭','missing'); await this.disablePlatform(platform); }
-        }catch{if(this.alive&&scope===this.options.scope()&&this.loginAttempts.get(platform)===attempt){this.setStatus(platform,'登录尚未完成，平台已关闭','error');await this.disablePlatform(platform);}}
+            else { this.setStatus(platform,platform.startsWith('web:')?'登录尚未完成；公开页面仍可直接剪藏。':'登录尚未完成，平台已关闭','missing'); await this.disablePlatform(platform); }
+        }catch{if(this.alive&&scope===this.options.scope()&&this.loginAttempts.get(platform)===attempt){this.setStatus(platform,platform.startsWith('web:')?'登录态保存失败，请重试。':'登录尚未完成，平台已关闭','error');await this.disablePlatform(platform);}}
         finally{if(this.loginAttempts.get(platform)===attempt)this.loginAttempts.delete(platform);}
     }
     private async disablePlatform(platform:LoginPlatform):Promise<void> {
         const base=this.base(platform);
+        if(base==='web')return;
         if(!this.options.settings.platformEnabled[base])return;
         this.options.settings.platformEnabled[base]=false;
         this.authenticated.delete(platform);this.expanded.delete(platform);this.controllers.get(platform)?.abort();
@@ -205,21 +211,6 @@ export class PlatformSettingsView {
         if(!this.alive || !this.options.available() || !this.expanded.has(platform))return;
         if(this.loginAttempts.has(platform)&&!promptLogin)return;
         this.authenticated.delete(platform);this.updateFeatures(platform);
-        if(platform.startsWith('web:')) {
-            const domain=platform.slice(4);
-            const features=this.options.settings.platforms.web;
-            if(this.options.settings.platformEnabled.web &&
-                !Object.values(features).some(Boolean)) {
-                const before={...features};
-                features.metadata=true;
-                features.article=true;
-                try{await this.options.enableProperties?.();await this.options.save();}
-                catch{Object.assign(features,before);this.setStatus(platform,'公开页面采集配置保存失败，请重试。','error');return;}
-            }
-            this.setStatus(platform,`${domain} · 公开页面可直接采集`,'authenticated');
-            this.updateFeatures(platform);
-            return;
-        }
         this.controllers.get(platform)?.abort();
         const controller=new AbortController();this.controllers.set(platform,controller);
         const scope=this.options.scope(),row=this.accountRows.get(platform);
@@ -228,10 +219,13 @@ export class PlatformSettingsView {
         try {
             const profile=await this.options.profile(platform,controller.signal);
             if(!this.alive||!row?.isConnected||controller.signal.aborted||scope!==this.options.scope()||!this.options.available())return;
-            if(profile.state==='authenticated')await this.unlock(platform,profile);
+            if(profile.state==='authenticated'){
+                if(platform.startsWith('web:')){this.authenticated.add(platform);this.setStatus(platform,'已保存本机登录态','authenticated');this.updateFeatures(platform);}
+                else await this.unlock(platform,profile);
+            }
             else {
-                this.setStatus(platform,profile.state==='expired'?'登录已失效，请重新登录':profile.state==='missing'?'尚未登录':'登录状态暂不可用',profile.state==='expired'?'expired':profile.state==='missing'?'missing':'error');
-                if(promptLogin&&(profile.state==='missing'||profile.state==='expired'))void this.login(platform);
+                this.setStatus(platform,profile.state==='expired'?'需要重新登录':profile.state==='missing'?'未保存登录态':'登录状态暂不可用',profile.state==='expired'?'expired':profile.state==='missing'?'missing':'error');
+                if(!platform.startsWith('web:')&&promptLogin&&(profile.state==='missing'||profile.state==='expired'))void this.login(platform);
             }
         } catch {if(this.alive&&!controller.signal.aborted&&row?.isConnected&&scope===this.options.scope())this.setStatus(platform,'登录状态暂不可用，请刷新或重新登录','error');}
         finally{window.clearTimeout(timeout);if(this.controllers.get(platform)===controller)this.controllers.delete(platform);}
@@ -239,6 +233,7 @@ export class PlatformSettingsView {
     expired(platform:LoginPlatform):void {
         this.controllers.get(platform)?.abort();this.authenticated.delete(platform);this.updateFeatures(platform);
         const base=this.base(platform);
+        if(base==='web'){this.setStatus(platform,'需要重新登录；公开页面仍可直接剪藏。','expired');return;}
         if(this.options.settings.platformEnabled[base]){
             this.options.settings.platformEnabled[base]=false;
             void this.options.save().catch(()=>undefined);

@@ -11,13 +11,15 @@ const context: TaskContext = {
   daily: false,
 };
 describe("durable companion queue", () => {
-  it("keeps all automatic features off and scopes settings by exact host", () => {
+  it("keeps platforms opt-in and gives generic pages only article defaults", () => {
     const settings = normalizeSettings({});
     expect(
-      Object.values(settings.platforms)
-        .flatMap(Object.values)
+      Object.entries(settings.platforms).filter(([platform])=>platform!=='web')
+        .flatMap(([,flags])=>Object.values(flags))
         .every((v) => v === false),
     ).toBe(true);
+    expect(Object.values(settings.platformEnabled).every(value=>!value)).toBe(true);
+    expect(settings.platforms.web).toEqual({metadata:true,article:true,images:true,video:false,comments:false,subtitles:false,files:false});
     expect(platformFor("https://bilibili.com.evil.test/video/42")).toBe("web");
     expect(platformFor(context.sourceUrl)).toBe("bilibili");
     expect(supportsFeature("web", "comments")).toBe(false);

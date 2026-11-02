@@ -4,7 +4,7 @@ import {
   type LocalProperties,
   type TaskContext,
 } from "./companion-protocol";
-import { FEATURES, type Feature } from "./config";
+import { FEATURES, platformFor, supportsFeature, type Feature } from "./config";
 import { hash } from "./storage";
 export type JobStatus =
   | "queued"
@@ -16,6 +16,7 @@ export type JobStatus =
   | "complete";
 export type QueueBucket = "in-progress" | "failed" | "complete";
 export interface SavedMaterial {
+  failures?: string[];
   properties: LocalProperties;
   assets: string[];
   files: Array<{ path: string; sha256: string }>;
@@ -32,6 +33,8 @@ export interface Job {
   retryCount?: number;
   nextAttemptAt?: number;
   lastError?: string;
+  /** Set before a generic login handoff; persisted to avoid reopening cancelled/ineffective prompts. */
+  authPrompted?: boolean;
   cloudStatus?: "success" | "failed" | "pending" | "unknown";
 }
 export interface QueueState {
@@ -103,7 +106,7 @@ export function readQueueState(value: unknown): QueueState {
       (j) =>
         j &&
         (!j.saved ||
-          (validateProperties(j.saved.properties) &&
+          ((j.saved.failures === undefined || (Array.isArray(j.saved.failures) && j.saved.failures.length<=1000 && j.saved.failures.every(value=>typeof value==='string'))) && validateProperties(j.saved.properties) &&
             Array.isArray(j.saved.assets) &&
             j.saved.assets.every(
               (p) =>
@@ -137,6 +140,7 @@ export function readQueueState(value: unknown): QueueState {
         (j.retryCount === undefined || (Number.isSafeInteger(j.retryCount) && j.retryCount >= 0)) &&
         (j.nextAttemptAt === undefined || (Number.isSafeInteger(j.nextAttemptAt) && j.nextAttemptAt >= 0)) &&
         (j.lastError === undefined || typeof j.lastError === 'string') &&
+        (j.authPrompted === undefined || typeof j.authPrompted === 'boolean') &&
         (j.cloudStatus === undefined || ['success','failed','pending','unknown'].includes(j.cloudStatus)),
     )
   )
@@ -151,6 +155,8 @@ export function readQueueState(value: unknown): QueueState {
       cloudStatus: j.cloudStatus === 'success' || j.cloudStatus === 'failed' || j.cloudStatus === 'pending' ? j.cloudStatus : 'unknown',
       status: j.status === "running" ? "queued" : j.status,
       message: j.status === "running" ? "上次处理被中断，等待恢复" : j.message,
+      ...(!supportsFeature(platformFor(j.context.sourceUrl), j.feature) && platformFor(j.context.sourceUrl) === 'web' && j.status !== 'complete'
+        ? { status: 'cancelled' as const, message: '通用网页已改为正文图文提取，停止旧的额外采集任务', nextAttemptAt: undefined } : {}),
     })),
   };
 }
@@ -181,6 +187,7 @@ export function enqueue(
     )
       return false;
     if (manual && existing.status === "complete") delete existing.saved;
+    if (manual) delete existing.authPrompted;
     existing.context = { ...context };
     existing.status = "queued";
     existing.message = "等待处理";

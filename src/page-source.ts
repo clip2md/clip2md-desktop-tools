@@ -1,14 +1,38 @@
+import { zsxqRead, type ZsxqReadOptions } from './adapters/zsxq-browser';
 import { withAbort } from "./async";
 import type { RenderedSnapshot } from "./adapters/rendered-sites";
 import { SiteSessions, AuthorizationRequired } from "./auth";
-import { platformFor } from "./config";
+import { platformFor, taobaoItemId } from "./config";
+import { taobaoLoadStep } from './taobao-page';
 import type { CommentBatch } from "./comments";
+import { parseZsxqResponse, zsxqArticleId, zsxqCommentEndpoint, zsxqTopicEndpoint, zsxqTopicId } from './adapters/zsxq';
 import {
   wechatChannelsPlayableAddress,
   wechatChannelsPlayableFromParse,
   wechatChannelsShareAddress,
 } from "./adapters/wechat-channels";
-export function snapshotPage(): RenderedSnapshot {
+export function snapshotPage(genericWeb = false): RenderedSnapshot {
+  if (genericWeb) {
+    const clone = document.documentElement.cloneNode(true) as HTMLElement;
+    const originals = Array.from(document.documentElement.querySelectorAll('*'));
+    const copies = Array.from(clone.querySelectorAll('*'));
+    let loginForm = false, loginOverlay = false;
+    const demand = /(?:请先?登录|登录后(?:查看|阅读|继续|访问|解锁)|登录(?:以|即可)(?:查看|阅读|继续|访问)|(?:sign|log)\s*in\s+to\s+(?:continue|read|view|access))/i;
+    for (const [index, original] of originals.entries()) {
+      const style = getComputedStyle(original);
+      const visible = !original.closest('[hidden],[aria-hidden="true"]') && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+      if (!visible) copies[index]?.setAttribute('hidden', '');
+      if (!visible || !original.getClientRects().length) continue;
+      if (original.matches('input[type="password"]')) loginForm = true;
+      const bounds = original.getBoundingClientRect();
+      const coversPage = ['fixed', 'absolute'].includes(style.position) && bounds.width * bounds.height >= innerWidth * innerHeight * 0.2;
+      if ((original.matches('[role="dialog"],dialog[open],[aria-modal="true"]') || coversPage) &&
+          (demand.test(original.textContent || '') || !!original.querySelector('input[type="password"]')))
+        loginOverlay = true;
+    }
+    clone.querySelectorAll('script:not([type="application/ld+json"])').forEach(node => node.remove());
+    return { url: location.href, html: clone.outerHTML, videos: [], audios: [], webAccess: { loginForm, loginOverlay } };
+  }
   const isXhs = /(?:^|\.)(?:xiaohongshu|rednote)\.com$/i.test(location.hostname);
   const xhsNoteState = (): unknown => {
     if (!isXhs) return;
@@ -180,6 +204,7 @@ function scrollComments(): void {
   scroller.scrollTop = scroller.scrollHeight;
   scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
 }
+
 /** Read top-level XHS comments already rendered after the comment scroller advances. */
 function pageComments(): Array<Record<string, unknown>> {
   return Array.from(document.querySelectorAll<HTMLElement>(".parent-comment"))
@@ -421,12 +446,17 @@ export async function sourcePage(
   url: string,
   signal: AbortSignal,
   onCommentBatch?: (batch: CommentBatch) => void,
+  zsxqOptions?: ZsxqReadOptions,
 ): Promise<RenderedSnapshot> {
   const platform = platformFor(url);
+  if (platform === 'taobao' && !taobaoItemId(url)) throw new Error('请使用包含商品 ID 的 HTTPS 淘宝/天猫电脑端详情链接');
   const needsCommentLoad = !!onCommentBatch || ["twitter", "weibo", "douban", "wechat", "kuaishou", "toutiao", "xiaoyuzhou"].includes(platform);
   const target = sessions.targetFor(url);
   signal.throwIfAborted();
   const win = await sessions.open(target, false);
+  let httpStatus: number | undefined;
+  const navigated = (_event: unknown, _url: string, status: number) => { httpStatus = status; };
+  if (platform === 'web' || platform === 'zsxq' || platform === 'taobao') win.webContents.on('did-navigate', navigated);
   const stop = () => sessions.release(win);
   signal.addEventListener("abort", stop, { once: true });
   let attached = false;
@@ -435,6 +465,11 @@ export async function sourcePage(
   let received = 0;
   let captureError: unknown;
   const pending = new Map<string, string>();
+  const zsxqPending = new Map<string,{topicId:string;status:number;detail:boolean;comments:boolean;videoId?:string}>();
+  const zsxqTopics: NonNullable<RenderedSnapshot['zsxqTopics']> = [];
+  const zsxqComments: NonNullable<RenderedSnapshot['zsxqComments']> = [];
+  let zsxqReceived=0;
+  const zsxqVideoUrls:NonNullable<RenderedSnapshot['zsxqVideoUrls']>=[];
   let documentReady: (()=>void)|undefined;
   const workIdFromUrl = workIdentityFromUrl;
   // Short links (for example v.douyin.com) do not contain the aweme id until
@@ -443,12 +478,36 @@ export async function sourcePage(
   let workId = workIdFromUrl(url);
   const captureNetworkMedia = ["douyin", "twitter", "wechat", "wechat-channel", "kuaishou", "toutiao"].includes(platform);
   try {
-    if (onCommentBatch || captureNetworkMedia) {
+    if (onCommentBatch || captureNetworkMedia || platform === 'zsxq') {
       win.webContents.debugger.attach("1.3");
       attached = true;
       win.webContents.debugger.on(
         "message",
         (_event: unknown, method: string, params: any) => {
+          if (platform === 'zsxq') {
+            if (method === 'Network.responseReceived' && zsxqReceived < 100 && typeof params.response?.url === 'string') {
+              const commentId=onCommentBatch?zsxqCommentEndpoint(params.response.url):undefined;
+              const endpoint=new URL(params.response.url);
+              const videoId=endpoint.protocol==='https:' && endpoint.hostname==='api.zsxq.com' && !endpoint.port && !endpoint.username && !endpoint.password ? endpoint.pathname.match(/^\/v2\/videos\/([1-9]\d{0,24})\/url$/)?.[1]:undefined;
+              const topicId=zsxqTopicEndpoint(params.response.url)||commentId|| (videoId?workId:undefined);
+              if(topicId && (!workId || workId===topicId)) {
+                zsxqReceived++;
+                zsxqPending.set(params.requestId,{topicId,status:params.response.status,detail:!new URL(params.response.url).pathname.endsWith('/info'),comments:!!commentId,videoId});
+              }
+            }
+            if(method==='Network.loadingFinished' && zsxqPending.has(params.requestId)) {
+              const source=zsxqPending.get(params.requestId)!;
+              zsxqPending.delete(params.requestId);
+              bodies.push((async()=>{
+                const body=await win.webContents.debugger.sendCommand('Network.getResponseBody',{requestId:params.requestId});
+                if(signal.aborted)return;
+                if(typeof body.body!=='string'||body.base64Encoded)throw new Error('知识星球主题响应格式无效');
+                const captured={topicId:source.topicId,status:source.status,detail:source.detail,payload:parseZsxqResponse(body.body)};
+                if(source.videoId){const payload=captured.payload as {succeeded?:boolean;resp_data?:{url?:string}};zsxqVideoUrls.push({id:source.videoId,url:source.status===200 && payload.succeeded===true?payload.resp_data?.url:undefined});}
+                else if(source.comments)zsxqComments.push(captured);else zsxqTopics.push(captured);
+              })().catch(error=>{captureError=error;}));
+            }
+          }
           if (
             captureNetworkMedia &&
             method === "Network.responseReceived" &&
@@ -626,7 +685,37 @@ export async function sourcePage(
         if (rows > 0) break;
       }
     }
-    for (let i = 0; i < (needsCommentLoad ? 12 : 3); i++) {
+    if (platform === 'taobao') {
+      // At most 6 s for hydration, then 8.4 s for lazy detail images. Stop on
+      // three unchanged snapshots; never scroll a review feed or click SKUs.
+      const detailSignal = AbortSignal.any([signal, AbortSignal.timeout(15000)]);
+      const step = (scroll: boolean) => withAbort(win.webContents.executeJavaScript(
+        `(${taobaoLoadStep.toString()})(${scroll})`, false,
+      ) as Promise<ReturnType<typeof taobaoLoadStep>>, detailSignal);
+      try {
+        for (let attempt = 0; attempt < 20; attempt++) {
+          const state = await step(false);
+          if (state.blocked) throw new AuthorizationRequired('淘宝/天猫需要人工完成原站登录或安全验证');
+          if (state.ready) break;
+          await pause(300, detailSignal);
+        }
+        let previous = '', unchanged = 0;
+        for (let attempt = 0; attempt < 24; attempt++) {
+          const state = await step(true);
+          if (state.blocked) throw new AuthorizationRequired('淘宝/天猫需要人工完成原站登录或安全验证');
+          unchanged = state.signature === previous ? unchanged + 1 : 0;
+          if (unchanged >= 3) break;
+          previous = state.signature;
+          await pause(350, detailSignal);
+        }
+      } catch (error) {
+        // The lazy-loading budget limits optional work. Keep the rendered
+        // product when it expires; extraction still validates login and title.
+        signal.throwIfAborted();
+        if (error instanceof AuthorizationRequired || !detailSignal.aborted) throw error;
+      }
+    }
+    for (let i = 0; i < (platform === 'taobao' ? 0 : needsCommentLoad ? 12 : 3); i++) {
       await pause(1000, signal);
       if (needsCommentLoad)
         await withAbort(
@@ -688,13 +777,17 @@ export async function sourcePage(
         // remains authoritative and will report a precise empty-response state.
       }
     }
+    if(platform==='zsxq' && !zsxqArticleId(url)) {
+      for(let attempt=0;attempt<12 && !zsxqTopics.length && !captureError;attempt++)await pause(500,signal);
+    }
     let snapshot = await withAbort(
       win.webContents.executeJavaScript(
-        `(${snapshotPage.toString()})()`,
+        `(${snapshotPage.toString()})(${platform === 'web' || platform === 'zsxq' || platform === 'taobao'})`,
         false,
       ) as Promise<RenderedSnapshot>,
       signal,
     );
+    if (platform === 'web' || platform === 'zsxq' || platform === 'taobao') snapshot.httpStatus = httpStatus;
     if (platform === "wechat-channel") {
       const shareUrl = wechatChannelsShareAddress(url);
       if (!shareUrl)
@@ -828,16 +921,18 @@ export async function sourcePage(
         ...snapshot.videos,
       ].slice(0, 32);
     }
+    if (platform === 'taobao' && taobaoItemId(snapshot.url) && taobaoItemId(snapshot.url) !== taobaoItemId(url))
+      throw new Error('淘宝/天猫已跳转到其他商品，未读取目标内容');
     if (
       !sessions.allowed(target,snapshot.url) || platformFor(snapshot.url) !== platform ||
       ((platform === "douyin" || platform === "xiaohongshu") &&
         new URL(url).pathname !== "/" && !workIdFromUrl(snapshot.url) &&
         !(platform === "douyin" && workId && /^\/(?:jingxuan)?$/.test(new URL(snapshot.url).pathname))) ||
-      (workId && workIdFromUrl(snapshot.url) !== workId)
+      (platform !== 'zsxq' && workId && workIdFromUrl(snapshot.url) !== workId)
     )
-      throw new AuthorizationRequired(
-        "页面跳转到登录或其他作品，请在原站授权后重试",
-      );
+      throw platform === 'web'
+        ? new Error('页面跳转到授权域名以外，未读取目标内容')
+        : new AuthorizationRequired("页面跳转到登录或其他作品，请在原站授权后重试");
     if (
       platform === "douyin" &&
       /(?:验证码中间页|安全验证|访问验证|请完成验证|滑块验证)/.test(snapshot.html) &&
@@ -852,8 +947,22 @@ export async function sourcePage(
       throw captureError instanceof Error
         ? captureError
         : new Error("评论采集失败");
+    if(platform==='zsxq') {
+      snapshot.zsxqVideoUrls=zsxqVideoUrls;
+      snapshot.zsxqTopics=zsxqTopics.filter(row=>!workId || row.topicId===workId);
+      snapshot.zsxqComments=zsxqComments.filter(row=>!workId || row.topicId===workId);
+      if(zsxqOptions){
+        await zsxqRead(win.webContents,snapshot,url,signal,zsxqOptions);
+        if(zsxqOptions.players){
+          for(let attempt=0;attempt<8 && zsxqPending.size;attempt++)await pause(250,signal);
+          await withAbort(Promise.all(bodies),signal);
+          if(captureError)throw captureError instanceof Error?captureError:new Error('知识星球播放器响应读取失败');
+        }
+      }
+    }
     return snapshot;
   } finally {
+    if (platform === 'web' || platform === 'zsxq' || platform === 'taobao') win.webContents.removeListener('did-navigate', navigated);
     if(documentReady)win.webContents.removeListener('dom-ready',documentReady);
     signal.removeEventListener("abort", stop);
     if (attached && !win.isDestroyed()) {
@@ -870,6 +979,7 @@ export async function sourcePage(
 /** Select a route-specific work identity without confusing a containing page. */
 export function workIdentityFromUrl(value: string): string | undefined {
   try {
+    if(platformFor(value)==='zsxq')return zsxqTopicId(value);
     const parsed = new URL(value);
     // Answer URLs can also contain broad article or video path segments.
     const answerId = parsed.pathname.match(/\/answer\/([1-9]\d{0,19})(?:\/|$)/)?.[1];

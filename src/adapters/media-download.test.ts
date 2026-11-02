@@ -328,3 +328,19 @@ it("classifies a connection reset without exposing the underlying signed URL", a
   ).rejects.toThrow("连接中断");
   expect(await fs.readdir(dir)).toEqual([]);
 });
+
+it('streams an ordinary topic document with source length and SHA256 validation',async()=>{
+  const bytes=Buffer.from('%PDF-1.7\nA document attachment'),dir=await directory();
+  sources([{headers:{'content-type':'application/pdf','content-length':String(bytes.length)},chunks:[bytes.subarray(0,8),bytes.subarray(8)]}]);
+  const result=await downloadPublicMedia('https://files.zsxq.com/document',new AbortController().signal,'https://wx.zsxq.com/topic/123',dir,undefined,{fileName:'原始文件名.pdf',expectedBytes:bytes.length});
+  expect(result.extension).toBe('pdf');expect(result.sha256).toBe(createHash('sha256').update(bytes).digest('hex'));expect(await fs.readFile(result.path)).toEqual(bytes);
+});
+it('rejects an octet-stream login page and mismatched original attachment size atomically',async()=>{
+  const dir=await directory();
+  sources([{headers:{'content-type':'application/octet-stream'},chunks:[Buffer.from('<!doctype html><html>登录</html>')]}]);
+  await expect(downloadPublicMedia('https://files.zsxq.com/document',new AbortController().signal,'https://wx.zsxq.com/topic/123',dir,undefined,{fileName:'document.pdf'})).rejects.toThrow('错误响应');
+  expect(await fs.readdir(dir)).toEqual([]);
+  sources([{headers:{'content-type':'application/pdf'},chunks:[Buffer.from('%PDF-1.7')]}]);
+  await expect(downloadPublicMedia('https://files.zsxq.com/document',new AbortController().signal,'https://wx.zsxq.com/topic/123',dir,undefined,{fileName:'document.pdf',expectedBytes:100})).rejects.toThrow('完整长度');
+  expect(await fs.readdir(dir)).toEqual([]);
+});

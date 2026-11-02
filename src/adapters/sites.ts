@@ -19,7 +19,28 @@ export interface SiteMediaSource {
   expectedDurationSeconds?: number;
   decryptKey?: string;
 }
+export interface SiteFile {
+  topicId: string;
+  id: string;
+  name: string;
+  bytes?: number;
+  url?: string;
+  error?: string;
+}
+export interface IndependentMedia extends SiteMediaSource {
+  id: string;
+  topicId: string;
+  title: string;
+  kind: "audio" | "video";
+  fileId?: string;
+  subtitles?: Array<{url: string; language?: string}>;
+  error?: string;
+}
 export interface SiteResult {
+  imageItems?: Array<{id:string;topicId:string;url:string}>;
+  files?: SiteFile[];
+  /** Independent works, never concatenated as parts of a single media. */
+  mediaItems?: IndependentMedia[];
   detectedMedia?: "audio" | "video";
   content: ExtractedContent;
   media?: SiteMediaSource & {

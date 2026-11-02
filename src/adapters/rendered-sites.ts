@@ -28,6 +28,15 @@ export interface RenderedVideo {
 export interface RenderedSnapshot {
   url: string;
   html: string;
+  httpStatus?: number;
+  webAccess?: { loginForm: boolean; loginOverlay: boolean };
+  /** Ephemeral first-party responses, never persisted or trusted from page markup. */
+  zsxqTopics?: Array<{topicId:string;status:number;payload:unknown;detail?:boolean}>;
+  zsxqComments?: Array<{topicId:string;status:number;payload:unknown}>;
+  zsxqVideoUrls?: Array<{id:string;url?:string}>;
+  zsxqFiles?: Array<{id:string;url?:string;error?:string}>;
+  zsxqPlayers?: import('./sites').IndependentMedia[];
+  zsxqCommentCoverage?: string;
   videos: RenderedVideo[];
   audios?: RenderedVideo[];
 }

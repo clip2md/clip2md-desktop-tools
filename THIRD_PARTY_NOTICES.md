@@ -12,6 +12,7 @@ The production bundle includes these libraries and their license notices:
 | --- | --- | --- |
 | @mixmark-io/domino | 2.2.0 | BSD-2-Clause |
 | @mozilla/readability | 0.6.0 | Apache-2.0 |
+| defuddle | 0.19.6 | MIT |
 | turndown | 7.2.1 | MIT |
 | acorn | 8.19.0 | MIT |
 | yaml | 2.9.1 | ISC |
@@ -81,3 +82,5 @@ cross-checking; no code from either project is vendored in this bundle.
 - Whisper 多语言 base 权重：https://huggingface.co/ggerganov/whisper.cpp ，原始 Whisper 模型 MIT，https://github.com/openai/whisper 。
 
 不再由用户选择模型或配置模型文件路径。市场源码与构建只保留手动依赖检测及修复说明，不含依赖安装器。
+
+Knowledge Planet adapter research: independently written TypeScript, with protocol/interaction references to zsxq-crawler (MIT, b2216874c5c8c0ea910222dcfc2102478db36a71), zsxq-fetcher (MIT, a770aca6c0c3a171cfa22d18004afe522fdc6b77), and dsh-zsxq (MIT, 7ad800f29b31d9e37655303299ed9059764f7e0e). No code or runtime dependencies from these projects are included. ForgeRSS (AGPL-3.0, 30560eb831dba3d1ee9fcc86c0548b487955dc8f) and license-unconfirmed SDK material were behavior/interface references only; no implementation was copied. See the repository's `docs/11-engineering/zsxq-local-clipping.md` for evidence and acceptance limits.

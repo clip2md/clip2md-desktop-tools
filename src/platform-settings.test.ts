@@ -10,7 +10,7 @@ vi.mock('obsidian',()=>({Notice:vi.fn(),Setting:class {
     addButton(fn:(button:unknown)=>void){const element=document.createElement('button');this.settingEl.appendChild(element);const button={setButtonText:(text:string)=>{element.textContent=text;return button;},setDisabled:(value:boolean)=>{element.disabled=value;return button;},onClick:(action:()=>void)=>{element.onclick=action;return button;}};fn(button);return this;}
 }}));
 import {PlatformSettingsView} from './platform-settings';
-import {normalizeSettings,validPreferences,PLATFORMS,FEATURES} from './config';
+import {normalizeSettings,validPreferences,PLATFORMS,FEATURES,supportsFeature} from './config';
 import type {AccountProfile} from './account-profile';
 function dom(){
     Object.assign(HTMLElement.prototype,{
@@ -53,18 +53,41 @@ describe('local clipping platform settings',()=>{
         const header=controls.toggles.findIndex(t=>name.startsWith(t.name));
         await controls.toggles[header].change!(true);await flush();
         expect(f.options.login).toHaveBeenCalledWith(platform);
-        expect(controls.toggles.slice(header+1,header+1+FEATURES.length).every(t=>t.disabled)).toBe(true);
+        expect(controls.toggles.slice(header+1,header+1+FEATURES.filter(feature=>supportsFeature(platform,feature)).length).every(t=>t.disabled)).toBe(true);
         f.view.dispose();
     });
-    it('adds a generic domain for anonymous public-page capture without opening a login window',async()=>{
-        const f=fixture({platformEnabled:{web:true}});f.options.profile.mockResolvedValue({state:'missing'});f.options.login.mockResolvedValue(false);
+    it('allows public generic capture with no domain and never prompts on render',async()=>{
+        const f=fixture({platformEnabled:{web:true}});await flush();
+        const toggles=controls.toggles.filter(toggle=>['基础来源属性','正文图文','正文图片'].includes(toggle.name)).slice(-3);
+        expect(toggles).toHaveLength(3);expect(toggles.every(toggle=>!toggle.disabled&&toggle.value)).toBe(true);
+        expect(f.options.login).not.toHaveBeenCalled();expect(f.settings.webDomains).toEqual([]);
+        f.view.dispose();
+    });
+    it('opens manual domain login without saving a cancelled domain or disabling public capture',async()=>{
+        const f=fixture({platformEnabled:{web:true}});f.options.login.mockResolvedValue(false);
         const card=f.root.querySelector('[data-platform="web"]')!;
-        const input=card.querySelector<HTMLInputElement>('input')!;input.value='https://Example.com/private/article';
-        [...card.querySelectorAll('button')].find(b=>b.textContent==='添加域名')!.click();await flush();
-        expect(f.settings.webDomains).toEqual(['example.com']);expect(f.options.login).not.toHaveBeenCalled();
-        expect(f.root.textContent).toContain('公开页面可直接采集');
-        expect(f.settings.platforms.web.metadata).toBe(true);
-        expect(f.settings.platforms.web.article).toBe(true);
+        card.querySelector<HTMLInputElement>('input')!.value='https://Example.com/private/article';
+        [...card.querySelectorAll('button')].find(b=>b.textContent==='添加并登录')!.click();await flush();
+        expect(f.options.login).toHaveBeenCalledWith('web:example.com','https://example.com/private/article');
+        expect(f.settings.webDomains).toEqual([]);expect(f.settings.platformEnabled.web).toBe(true);
+        f.view.dispose();
+    });
+    it('reopens an existing domain for manual login and keeps its record on cancellation',async()=>{
+        const f=fixture({platformEnabled:{web:true},webDomains:['example.com']});await flush();
+        f.options.login.mockResolvedValue(false);f.options.profile.mockResolvedValue({state:'missing'});
+        const card=f.root.querySelector('[data-platform="web"]')!;
+        card.querySelector<HTMLInputElement>('input')!.value='example.com';
+        [...card.querySelectorAll('button')].find(b=>b.textContent==='添加并登录')!.click();await flush();
+        expect(f.options.login).toHaveBeenCalledWith('web:example.com','https://example.com/');
+        expect(f.settings.webDomains).toEqual(['example.com']);expect(f.settings.platformEnabled.web).toBe(true);
+        f.view.expired('web:example.com');expect(f.settings.platformEnabled.web).toBe(true);
+        expect(f.root.textContent).toContain('需要重新登录');f.view.dispose();
+    });
+    it('distinguishes missing and stored generic sessions without auto-login',async()=>{
+        const f=fixture({platformEnabled:{web:true},webDomains:['example.com']});await flush();
+        expect(f.root.textContent).toContain('已保存本机登录态');
+        f.options.profile.mockResolvedValue({state:'missing'});await f.view.refresh('web:example.com');
+        expect(f.root.textContent).toContain('未保存登录态');expect(f.options.login).not.toHaveBeenCalled();
         f.view.dispose();
     });
     it.each(['bilibili','douyin','xiaohongshu'] as const)('prompts login for %s and keeps every feature locked until authenticated',async platform=>{
@@ -142,4 +165,22 @@ describe('local clipping platform settings',()=>{
         expect(f.settings.platformEnabled.bilibili).toBe(false);expect(f.settings.platforms.bilibili.video).toBe(true);
         expect(validPreferences({platformEnabled:{bilibili:'invalid'}})).toBe(false);f.view.dispose();
     });
+});
+
+it('offers only product metadata, Markdown and images for Taobao/Tmall',async()=>{
+    const f=fixture({platformEnabled:{taobao:true}});await flush();
+    const card=f.root.querySelector('[data-platform="taobao"]')!;
+    expect(card.textContent).toContain('淘宝/天猫');
+    expect(card.textContent).toContain('Markdown');
+    expect(card.textContent).not.toContain('字幕');
+    expect(card.textContent).not.toContain('视频／音频');
+    expect(f.settings.platforms.taobao).toMatchObject({metadata:true,article:true,images:true,video:false,comments:false,subtitles:false});
+    f.view.dispose();
+});
+
+it('keeps upgraded Knowledge Planet media, files and subtitles opt-in after account refresh',async()=>{
+    dom();const root=document.createElement('div'),settings=normalizeSettings({platformEnabled:{zsxq:true},platforms:{zsxq:{article:true,metadata:true,images:true,comments:true}}});
+    const options={settings,available:()=>true,scope:()=> 'binding',save:vi.fn(async()=>{}),platformChanged:vi.fn(),login:vi.fn(async()=>({state:'authenticated' as const,nickname:'作者'})),revoke:vi.fn(async()=>{}),profile:vi.fn(async()=>({state:'authenticated' as const,nickname:'作者'}))};
+    const view=new PlatformSettingsView(root,options);view.render();await flush();
+    expect(settings.platforms.zsxq).toMatchObject({article:true,files:false,video:false,subtitles:false});view.dispose();
 });

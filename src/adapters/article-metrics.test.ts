@@ -255,7 +255,7 @@ describe("source article interaction counters", () => {
     }
     expect((window as any).__metricScriptRan).toBeUndefined();
   });
-  it("collects metrics only after a template opts in and never turns a login shell into article success", () => {
+  it("omits generic metrics even if a template opts in and never saves a login shell", () => {
     const html = documentFor(article(counter("LikeAction", 0))).documentElement
       .outerHTML;
     expect(
@@ -268,7 +268,7 @@ describe("source article interaction counters", () => {
     expect(extractWebPage(html, url).metrics).toBeUndefined();
     expect(
       extractWebPage(html, url, { includeMetrics: true }).metrics,
-    ).toMatchObject({ likes: 0 });
+    ).toBeUndefined();
     const shell = html.replace(
       /<article>[\s\S]*?<\/article>/,
       "<p>请登录后查看</p>",

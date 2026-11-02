@@ -16,6 +16,14 @@ describe('saved domain login inspection',()=>{
         const sessions={hasStoredAuthorization:()=>false,hasLocalStorageAuthorization:()=>false,authorizedCookies:async()=>[{name:'visitor',value:'anonymous'}]};
         expect(await readAccountProfile(sessions as unknown as SiteSessions,'web:example.com',new AbortController().signal)).toEqual({state:'missing'});
     });
+    it('confirms Knowledge Planet through its first-party v3 self endpoint without assuming a cookie name',async()=>{
+        let listener!:(event:unknown,method:string,params:unknown)=>void;
+        const release=vi.fn();
+        const window={isDestroyed:()=>false,loadURL:vi.fn(async()=>{listener(null,'Network.responseReceived',{requestId:'zsxq',response:{url:'https://api.zsxq.com/v3/users/self',status:200}});listener(null,'Network.loadingFinished',{requestId:'zsxq'});}),webContents:{debugger:{attach:vi.fn(),detach:vi.fn(),on:(_name:string,fn:typeof listener)=>{listener=fn;},sendCommand:async(command:string)=>command==='Network.getResponseBody'?{body:JSON.stringify({succeeded:true,resp_data:{user:{uid:'123456789123456789',name:'星球用户'}}})}:{}},executeJavaScript:vi.fn(async()=>{})}};
+        const sessions={hasStoredAuthorization:()=>false,hasLocalStorageAuthorization:()=>false,authorizedCookies:async()=>[],open:async()=>window,release};
+        expect(await readAccountProfile(sessions as unknown as SiteSessions,'zsxq',new AbortController().signal)).toEqual({state:'authenticated',nickname:'星球用户'});
+        expect(window.loadURL).toHaveBeenCalledWith('https://wx.zsxq.com/');expect(release).toHaveBeenCalledWith(window);
+    });
     it('reports a manually saved localStorage session honestly without inventing an account nickname',async()=>{
         const sessions={hasStoredAuthorization:()=>true,hasLocalStorageAuthorization:()=>true,authorizedCookies:async()=>[]};
         expect(await readAccountProfile(sessions as unknown as SiteSessions,'web:example.com',new AbortController().signal)).toEqual({state:'authenticated',nickname:'example.com',sessionOnly:true});
@@ -133,4 +141,19 @@ describe('current account identity',()=>{
         await readAccountProfile(sessions as unknown as SiteSessions,'xiaohongshu',controller.signal);
         expect(release).toHaveBeenCalledWith(window);
     });
+});
+
+it('does not trust Taobao visitor cookies, an expired buyer session or cookies from another domain',async()=>{
+  const visitor={name:'_m_h5_tk',value:'visitor',domain:'.taobao.com',path:'/'};
+  const buyer=[{name:'cookie2',value:'session',domain:'.taobao.com',path:'/'},{name:'unb',value:'123',domain:'.taobao.com',path:'/'}];
+  const sessions={hasStoredAuthorization:()=>true,hasLocalStorageAuthorization:()=>true,authorizedCookies:vi.fn(async()=>[visitor]),open:vi.fn()};
+  const read=()=>readAccountProfile(sessions as unknown as SiteSessions,'taobao',new AbortController().signal);
+  expect(await read()).toEqual({state:'expired'});
+  sessions.authorizedCookies.mockResolvedValue(buyer);
+  expect(await read()).toMatchObject({state:'authenticated',nickname:'淘宝/天猫',sessionOnly:true});
+  sessions.authorizedCookies.mockResolvedValue(buyer.map(cookie=>({...cookie,domain:'.evil.test'})));
+  expect(await read()).toEqual({state:'expired'});
+  sessions.authorizedCookies.mockResolvedValue(buyer.map(cookie=>({...cookie,expirationDate:1})));
+  expect(await read()).toEqual({state:'expired'});
+  expect(sessions.open).not.toHaveBeenCalled();
 });

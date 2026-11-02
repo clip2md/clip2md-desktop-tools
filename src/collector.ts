@@ -1,3 +1,4 @@
+import { collectZsxqResources } from './adapters/zsxq-collection';
 import { transcribe } from "./transcription";
 import { imageExtension } from "./images";
 import fs from "node:fs/promises";
@@ -6,17 +7,19 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { resolveSiteLink, applePodcastsLink } from "./adapters/site-link";
 import { SiteMediaUnavailable, SiteGalleryUnavailable, canonicalDouyinVideoUrl, type SiteResult, } from "./adapters/sites";
-import { type ExtractedContent } from "./adapters/extract";
+import { ArticleAccessRequired, type ExtractedContent } from "./adapters/extract";
 import { readPublicImage, readPublicJson, sourceRequestHeaders } from "./adapters/network";
 import { downloadPublicMedia, MediaCandidateUnavailable, type DownloadedMedia, } from "./adapters/media-download";
 import { extractRenderedSitePage } from "./adapters/rendered-sites";
 import { collectComments, renderComments } from "./comments";
 import { AuthorizationRequired, type SiteSessions } from "./auth";
+import { ZsxqArticleRequired, zsxqPage, zsxqTopicId } from './adapters/zsxq';
 import { sourcePage } from "./page-source";
 import { MaterialStore } from "./storage";
 import { authenticatedPage } from './adapters/authenticated-page';
 import { nowBeijingDateTime } from './date-format';
 import { platformFor, type DesktopSettings, type Feature, } from "./config";
+import { resolveTaobaoProduct } from './adapters/taobao-link';
 import { checkTool, discoverVideo, downloadMediaWithYtDlp, downloadYouTubeMedia, runTool } from "./tools";
 import type { ResolverProxy } from "./adapters/resolver-proxy";
 import type { TaskContext, LocalProperties } from "./companion-protocol";
@@ -24,6 +27,8 @@ export interface CollectionResult {
     properties: LocalProperties;
     assets: string[];
     body: string;
+    failures?: string[];
+    imageReplacements?: Record<string,string>;
 }
 /** The source file is valid, but contains no audio stream to transcribe. */
 export class LocalMediaNoAudio extends Error {
@@ -166,6 +171,7 @@ async function downloadFfmpegMedia(
     settings: DesktopSettings,
     directory: string,
     signal: AbortSignal,
+    bounded = false,
 ): Promise<DownloadedMedia> {
     const input = new URL(value);
     input.hash = "";
@@ -177,17 +183,24 @@ async function downloadFfmpegMedia(
         .join("");
     const target = path.join(directory, "site-hls-input.mkv");
     await checkTool("ffmpeg", settings, directory, signal);
-    await runTool(settings.ffmpeg, [
-        "-nostdin", "-hide_banner", "-loglevel", "error",
-        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-        ...(ffmpegHeaders ? ["-headers", ffmpegHeaders] : []),
-        "-i", inputUrl,
-        "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy", "-y", target,
-    ], directory, signal, settings.timeoutMinutes * 60000);
+    if(bounded && input.protocol!=='https:')throw new Error('知识星球播放列表仅支持 HTTPS');
+    const proxy=bounded?await (await import('./adapters/resolver-proxy')).createResolverProxy(signal,undefined,{maxBytes:settings.maxBytes+1024*1024,timeoutMs:settings.timeoutMinutes*60000,maxConnections:10000,domains:[input.hostname,'zsxq.com']}):undefined;
+    try {
+        const output=await runTool(settings.ffmpeg, [
+            "-nostdin", "-hide_banner", "-loglevel", "error",
+            "-protocol_whitelist", bounded?"http,https,tcp,tls,crypto":"file,http,https,tcp,tls,crypto",
+            ...(proxy?['-http_proxy',proxy.url]:[]),
+            ...(ffmpegHeaders ? ["-headers", ffmpegHeaders] : []),
+            "-i", inputUrl,
+            "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy",
+            ...(bounded?['-fs',String(settings.maxBytes),'-progress','pipe:1']:[]),"-y", target,
+        ], directory, signal, settings.timeoutMinutes * 60000);
+        if(bounded && (!output.includes('progress=end') || proxy!.counts().denied))throw new Error('播放列表下载未完整结束或包含不支持的资源地址');
+    } finally {await proxy?.close();}
     const stat = await fs.stat(target).catch(() => undefined);
     if (!stat?.isFile() || stat.size <= 0)
         throw new Error("原站媒体未生成可播放文件");
-    if (stat.size > settings.maxBytes)
+    if (stat.size > settings.maxBytes || (bounded && stat.size >= settings.maxBytes))
         throw new Error("合并后的 HLS 视频超过本地下载上限");
     return fingerprint(target, "mkv", signal);
 }
@@ -218,15 +231,23 @@ function metadata(content: ExtractedContent): LocalProperties {
         }
     return result;
 }
-export async function resolveSource(context: TaskContext, sessions: SiteSessions, signal: AbortSignal): Promise<SiteResult> {
+export async function resolveSource(context: TaskContext, sessions: SiteSessions, signal: AbortSignal, feature?: Feature): Promise<SiteResult> {
     const platform = platformFor(context.sourceUrl);
-    const sourceUrl = platform === "douyin" ? (canonicalDouyinVideoUrl(context.sourceUrl) || context.sourceUrl) : context.sourceUrl;
+    const sourceUrl = platform === 'taobao' ? await resolveTaobaoProduct(context.sourceUrl, signal)
+        : platform === "douyin" ? (canonicalDouyinVideoUrl(context.sourceUrl) || context.sourceUrl) : context.sourceUrl;
     if(!['bilibili','douyin','xiaohongshu','xiaoyuzhou'].includes(platform)) {
         if (platform === 'applepodcasts')
             return await applePodcastsLink(sourceUrl, signal, undefined, true);
-        const snapshot=await sourcePage(sessions,sourceUrl,signal);
+        const snapshot=await sourcePage(sessions,sourceUrl,signal,undefined,platform==='zsxq'?{files:['files','video','subtitles'].includes(feature||''),players:['video','subtitles'].includes(feature||'')}:undefined).catch((error:unknown)=>{if(error instanceof ArticleAccessRequired)throw new AuthorizationRequired(error.message);throw error;});
         try{return authenticatedPage(snapshot,sourceUrl);}
-        catch(error){if(error instanceof Error&&/登录|验证/.test(error.message))throw new AuthorizationRequired(error.message);throw error;}
+        catch(error){
+            if(platform==='zsxq' && error instanceof ZsxqArticleRequired) {
+                const article=await sourcePage(sessions,error.articleUrl,signal,undefined,{players:['video','subtitles'].includes(feature||''),topicId:error.related.files?.[0]?.topicId||error.related.mediaItems?.[0]?.topicId||zsxqTopicId(context.sourceUrl)});
+                try{const result=zsxqPage(article,error.articleUrl,error.metadata);return {...result,imageItems:error.related.imageItems,files:error.related.files,mediaItems:[...(error.related.mediaItems||[]),...(article.zsxqPlayers||[])]};}
+                catch(articleError){if(articleError instanceof ArticleAccessRequired)throw new AuthorizationRequired(articleError.message);throw articleError;}
+            }
+            if(error instanceof ArticleAccessRequired || (!['web','zsxq'].includes(platform) && error instanceof Error&&/登录|验证/.test(error.message)))throw new AuthorizationRequired(error.message);throw error;
+        }
     }
     try {
         return await resolveSiteLink(sourceUrl, signal, true);
@@ -285,7 +306,7 @@ async function saveVideoCover(context: TaskContext, existingVideo: string, setti
     return { properties: {}, assets: [saved], body: `[本地封面](</${saved.split("/").map(encodeURIComponent).join("/")}>)` };
 }
 /** Save readable content and its selected images without sending page credentials to the cloud. */
-export async function saveArticle(context:TaskContext,result:SiteResult,settings:DesktopSettings,store:MaterialStore,signal:AbortSignal):Promise<{body:string;assets:string[];markdown:string}> {
+export async function saveArticle(context:TaskContext,result:SiteResult,settings:DesktopSettings,store:MaterialStore,signal:AbortSignal):Promise<{body:string;assets:string[];markdown:string;failures?:string[]}> {
     let markdown=result.content.markdown || result.content.source_description || '';
     const assets:string[]=[];
     let directory='';
@@ -293,7 +314,12 @@ export async function saveArticle(context:TaskContext,result:SiteResult,settings
     let remaining=settings.maxBytes;
     let failed=0;
     try {
-        if(settings.platforms[platformFor(context.sourceUrl)].images)for(const [index,url] of urls.entries()) {
+        if(platformFor(context.sourceUrl)==='zsxq' && settings.platforms.zsxq.images) {
+            const captured=await collectZsxqResources(result,context,'images',settings,store,signal,()=>{},{refresh:async()=>result,hls:async()=>{throw new Error('图片任务不读取媒体');}});
+            assets.push(...captured.assets);failed=captured.failures?.length||0;
+            for(const [url,file] of Object.entries(captured.imageReplacements||{}))markdown=markdown.split(url).join(`/${file.split('/').map(encodeURIComponent).join('/')}`);
+        }
+        else if(settings.platforms[platformFor(context.sourceUrl)].images)for(const [index,url] of urls.entries()) {
             signal.throwIfAborted();
             try {
                 const image=await readPublicImage(url,signal,context.sourceUrl),bytes=Buffer.from(image.arrayBuffer),extension=imageExtension(bytes);
@@ -311,17 +337,29 @@ export async function saveArticle(context:TaskContext,result:SiteResult,settings
                 failed++;
             }
         }
-        if(!markdown.trim())markdown='> 页面含音视频，未取得独立图文正文。请使用视频／音频采集保存媒体原件。';
+        if(!markdown.trim())markdown=platformFor(context.sourceUrl)==='zsxq'?'> 本主题没有文字正文。文件和音视频请按对应能力保存。':'> 页面含音视频，未取得独立图文正文。请使用视频／音频采集保存媒体原件。';
         if(failed)markdown+=`\n\n> ${failed} 张正文图片未能保存，已保留原站链接，可稍后重试。`;
         const file=await store.text(context,'article',`# ${result.content.source_title||result.content.title}\n\n${markdown}`);
         assets.unshift(file);
-        return {assets,markdown,body:`[正文图文](</${file.split('/').map(encodeURIComponent).join('/')}>)\n\n${markdown}`};
+        return {assets,markdown,...(failed && platformFor(context.sourceUrl)==='zsxq'?{failures:[`${failed} 张正文图片未保存`]}:{}),body:`[正文图文](</${file.split('/').map(encodeURIComponent).join('/')}>)\n\n${markdown}`};
     } finally {if(directory)await fs.rm(directory,{recursive:true,force:true});}
 }
 export async function collect(context: TaskContext, feature: Feature, settings: DesktopSettings, sessions: SiteSessions, store: MaterialStore, signal: AbortSignal, progress: (message: string) => void, existingAssets: string[] = []): Promise<CollectionResult> {
     const platform = platformFor(context.sourceUrl);
+    if (platform === 'web' && !['metadata', 'article', 'images'].includes(feature))
+        return { properties: {}, assets: [], body: '' };
+    if(platform==='zsxq' && ['files','video','subtitles','images'].includes(feature)) {
+        const result=await resolveSource(context,sessions,signal,feature);
+        return collectZsxqResources(result,context,feature,settings,store,signal,progress,{
+            refresh:()=>resolveSource(context,sessions,signal,feature),
+            hls:(url,referer,directory)=>downloadFfmpegMedia(url,referer,settings,directory,signal,true),
+        });
+    }
+    if(platform==='taobao' && !['metadata','article','images'].includes(feature))
+        return {properties:{},assets:[],body:''};
     const isBilibiliOpus = platform === "bilibili" && /^\/opus\/[A-Za-z0-9]+(?:\/|$)/.test(new URL(context.sourceUrl).pathname);
     const assets: string[] = [];
+    const failures:string[]=[];
     let properties: LocalProperties = {};
     let body = "";
     let directory = "";
@@ -391,6 +429,7 @@ export async function collect(context: TaskContext, feature: Feature, settings: 
             const article=await saveArticle(context,result,settings,store,signal);
             assets.push(...article.assets);properties=metadata(result.content);
             body=article.body;
+            failures.push(...(article.failures||[]));
             if(feature==='video')body='> 页面未探测到可下载音视频，已保存正文图文。\n\n'+body;
         }
         else if (feature === "video" && platform === "xiaohongshu" && detected && !detected.media && !detected.detectedMedia) {
@@ -777,6 +816,7 @@ export async function collect(context: TaskContext, feature: Feature, settings: 
                         failed++;
                     }
                 }
+                if(platform==='zsxq' && failed)failures.push(`${failed} 张原图下载失败`);
                 if (!assets.length)
                     throw new Error("原图全部下载失败");
                 body =
@@ -800,7 +840,7 @@ export async function collect(context: TaskContext, feature: Feature, settings: 
                     "\n\n" + result.content.warnings.map((w) => "> " + w).join("\n");
         }
         signal.throwIfAborted();
-        return { properties, assets, body };
+        return { properties, assets, body, ...(failures.length?{failures}:{}) };
     }
     finally {
         if (directory)

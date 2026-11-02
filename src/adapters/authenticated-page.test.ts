@@ -15,30 +15,14 @@ describe('authenticated page extraction',()=>{
     it('keeps short image-only content',()=>{
         expect(authenticatedPage(snapshot('<title>图片</title><main><img src="/one.jpg"></main>'),'https://example.com/article').content.markdown).toContain('https://example.com/one.jpg');
     });
-    it.each(['audio','video'] as const)('detects %s with a directly downloadable source',kind=>{
-        const result=authenticatedPage(snapshot(page,{[kind==='video'?'videos':'audios']:[{src:'https://cdn.example.com/media.mp4',visible:true,playing:false,area:100,identities:[]}]}),'https://example.com/article');
-        expect(result.detectedMedia).toBe(kind);expect(result.media?.url).toBe('https://cdn.example.com/media.mp4');
+    it.each(['audio','video'] as const)('omits generic %s even when a direct source is visible',kind=>{
+        const result=authenticatedPage(snapshot(page+`<${kind} src="/media.mp4"></${kind}>`,{[kind==='video'?'videos':'audios']:[{src:'https://cdn.example.com/media.mp4',visible:true,playing:false,area:100,identities:[]}]}),'https://example.com/article');
+        expect(result.media).toBeUndefined();expect(result.detectedMedia).toBeUndefined();expect(result.content.markdown).not.toContain('media.mp4');
     });
-    it('detects MSE video but never treats blob URLs as downloadable files',()=>{
-        const result=authenticatedPage(snapshot(page,{videos:[{src:'blob:https://example.com/id',visible:true,playing:true,area:100,identities:[]}]}),'https://example.com/article');
-        expect(result.detectedMedia).toBe('video');expect(result.media).toBeUndefined();
-    });
-    it('detects a lazy audio source and an embedded video player',()=>{
-        const audio=authenticatedPage(snapshot(page+'<audio preload="none"><source src="/track.mp3"></audio>'),'https://example.com/article');
-        expect(audio.detectedMedia).toBe('audio');expect(audio.media?.url).toBe('https://example.com/track.mp3');
-        const embedded=authenticatedPage(snapshot(page+'<iframe src="https://www.youtube.com/embed/test"></iframe>'),'https://example.com/article');
-        expect(embedded.detectedMedia).toBe('video');expect(embedded.media).toBeUndefined();
-    });
-    it('keeps source JSON-LD counters for generic authenticated sites',()=>{
-        const json=JSON.stringify({
-            '@context':'https://schema.org','@type':'Article','@id':'https://example.com/article',
-            url:'https://example.com/article',headline:'页面标题',interactionStatistic:[
-                {'@type':'InteractionCounter',interactionType:{'@type':'LikeAction'},userInteractionCount:12},
-                {'@type':'InteractionCounter',interactionType:{'@type':'CommentAction'},userInteractionCount:3},
-            ],
-        });
-        const result=authenticatedPage(snapshot(`<title>页面标题</title><script type="application/ld+json">${json}</script><main><h1>页面标题</h1><p>正文</p></main>`),'https://example.com/article');
-        expect(result.content.metrics).toMatchObject({likes:12,comments:3});
+    it('omits generic JSON-LD counters and an independent cover',()=>{
+        const json=JSON.stringify({'@context':'https://schema.org','@type':'Article',headline:'页面标题',interactionStatistic:[{'@type':'InteractionCounter',interactionType:{'@type':'LikeAction'},userInteractionCount:12}]});
+        const result=authenticatedPage(snapshot(`<meta property="og:image" content="https://example.com/cover.jpg"><script type="application/ld+json">${json}</script>${page}`),'https://example.com/article');
+        expect(result.content.metrics).toBeUndefined();expect(result.content.markdown).not.toContain('cover.jpg');
     });
     it.each([
         '<title>标题</title><main><h1>标题</h1></main>',

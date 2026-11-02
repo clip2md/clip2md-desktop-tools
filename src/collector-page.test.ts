@@ -6,12 +6,13 @@ import path from 'node:path';
 const mocks=vi.hoisted(()=>({page:vi.fn(),publicSource:vi.fn(),image:vi.fn(),media:vi.fn(),discover:vi.fn(),runTool:vi.fn(),checkTool:vi.fn(),ytDlpMedia:vi.fn()}));
 vi.mock('./page-source',()=>({sourcePage:mocks.page}));
 vi.mock('./adapters/site-link',()=>({resolveSiteLink:mocks.publicSource}));
-vi.mock('./adapters/network',()=>({readPublicImage:mocks.image,readPublicJson:vi.fn(),sourceRequestHeaders:vi.fn(async()=>({'User-Agent':'test'}))}));
+vi.mock('./adapters/network',()=>({readPublicImage:mocks.image,readPublicJson:vi.fn(),readWebPageResult:vi.fn(),sourceRequestHeaders:vi.fn(async()=>({'User-Agent':'test'}))}));
 vi.mock('./adapters/media-download',()=>({downloadPublicMedia:mocks.media,MediaCandidateUnavailable:class MediaCandidateUnavailable extends Error {}}));
 vi.mock('./tools',()=>({discoverVideo:mocks.discover,checkTool:mocks.checkTool,runTool:mocks.runTool,downloadMediaWithYtDlp:mocks.ytDlpMedia,downloadYouTubeMedia:vi.fn()}));
 vi.mock('./adapters/resolver-proxy',()=>({createResolverProxy:vi.fn(async()=>({url:'http://127.0.0.1:1',counts:()=>({connections:0,accepted:0,denied:0,bytes:0}),close:vi.fn(async()=>{})}))}));
 import { collect, resolveSource, saveArticle, isHlsMediaUrl, uniqueMediaCandidates } from './collector';
 import { normalizeSettings } from './config';
+import { AuthorizationRequired } from './auth';
 import type { TaskContext } from './companion-protocol';
 import type { MaterialStore } from './storage';
 const context:TaskContext={taskId:42,bindingScope:'a'.repeat(64),sourceUrl:'https://example.com/private',contentVersion:'1',notePath:'收藏/文章.md',daily:false};
@@ -43,18 +44,10 @@ describe('local authenticated capture',()=>{
         const result=await resolveSource(context,{} as never,new AbortController().signal);
         expect(mocks.page).toHaveBeenCalled();expect(mocks.publicSource).not.toHaveBeenCalled();expect(result.content.markdown).toContain('登录后显示');
     });
-    it('falls back to article content without invoking video tools if no media is detected',async()=>{
-        const result=await collect(context,'video',normalizeSettings({}),{} as never,store(),new AbortController().signal,()=>{});
-        expect(result.body).toContain('未探测到可下载音视频');expect(result.body).toContain('登录后显示');expect(mocks.discover).not.toHaveBeenCalled();
-    });
-    it('treats a generic image post with a hidden video element as article-only',async()=>{
-        mocks.page.mockResolvedValue({url:context.sourceUrl,html:'<title>微博图文</title><main><article><p>这是可见的微博正文</p><img src="https://wx1.sinaimg.cn/large/example.jpg"></article><video></video></main>',videos:[]});
+    it.each(['video','comments','subtitles'] as const)('never runs old generic %s jobs or invokes media tools',async feature=>{
         const material=store();
-        const result=await collect(context,'video',normalizeSettings({}),{} as never,material,new AbortController().signal,()=>{});
-        expect(result.body).toContain('未探测到可下载音视频');
-        expect(result.body).toContain('这是可见的微博正文');
-        expect(mocks.discover).not.toHaveBeenCalled();
-        expect(mocks.ytDlpMedia).not.toHaveBeenCalled();
+        await expect(collect(context,feature,normalizeSettings({}),{} as never,material,new AbortController().signal,()=>{})).resolves.toEqual({properties:{},assets:[],body:''});
+        expect(mocks.page).not.toHaveBeenCalled();expect(mocks.discover).not.toHaveBeenCalled();expect(mocks.ytDlpMedia).not.toHaveBeenCalled();expect(material.media).not.toHaveBeenCalled();
     });
     it('skips video and comments for Bilibili Opus articles instead of invoking video tools',async()=>{
         const opus={...context,sourceUrl:'https://www.bilibili.com/opus/1261621092485693461/'};
@@ -95,11 +88,12 @@ describe('local authenticated capture',()=>{
         await expect(collect(xhs,'video',normalizeSettings({}),{} as never,store(),new AbortController().signal,()=>{})).resolves.toMatchObject({body:expect.stringContaining('图集不含视频')});
         expect(mocks.discover).not.toHaveBeenCalled();
     });
-    it('saves the detected audio directly as audio',async()=>{
+    it('keeps direct audio capture for a dedicated platform',async()=>{
         mocks.page.mockResolvedValue({url:context.sourceUrl,html:'<title>音频正文</title><main><p>音频说明正文</p></main>',videos:[],audios:[{src:'https://example.com/audio.mp3',visible:true,playing:false,area:0,identities:[]}]});
         mocks.media.mockResolvedValue({path:'/fixture/audio.mp3',extension:'mp3',bytes:100,sha256:'fixture'});
-        const material=store();const result=await collect(context,'video',normalizeSettings({}),{} as never,material,new AbortController().signal,()=>{});
-        expect(material.media).toHaveBeenCalledWith(context,'audio',expect.objectContaining({extension:'mp3'}),expect.any(AbortSignal));
+        const dedicated={...context,sourceUrl:'https://www.lizhi.fm/123/1'};
+        const material=store();const result=await collect(dedicated,'video',normalizeSettings({}),{} as never,material,new AbortController().signal,()=>{});
+        expect(material.media).toHaveBeenCalledWith(dedicated,'audio',expect.objectContaining({extension:'mp3'}),expect.any(AbortSignal));
         expect(result.assets).toHaveLength(1);expect(mocks.discover).not.toHaveBeenCalled();
     });
     it('saves selected article images and rewrites image links to local Vault paths',async()=>{
@@ -225,4 +219,20 @@ describe('local authenticated capture',()=>{
         expect(result.assets).toHaveLength(1);
         expect(mocks.media).toHaveBeenCalledWith(mediaUrl,expect.any(AbortSignal),x.sourceUrl,expect.any(String),expect.any(Function),expect.any(Object));
     });
+});
+
+it('routes Taobao through the local product adapter and turns challenges into paused authorization errors',async()=>{
+  const product={...context,sourceUrl:'https://item.taobao.com/item.htm?id=123'};
+  mocks.page.mockResolvedValue({url:product.sourceUrl,html:'<h1>键盘</h1><div id="description">商品介绍<img src="https://img.alicdn.com/a.jpg"></div>',videos:[]});
+  const result=await resolveSource(product,{} as never,new AbortController().signal);
+  expect(result.content.markdown).toContain('商品介绍');
+  expect(mocks.publicSource).not.toHaveBeenCalled();
+  mocks.page.mockResolvedValue({url:product.sourceUrl,html:'<title>安全验证</title><div class="nc-container">拖动滑块</div>',videos:[]});
+  await expect(resolveSource(product,{} as never,new AbortController().signal)).rejects.toBeInstanceOf(AuthorizationRequired);
+});
+
+it.each(['video','comments','subtitles'] as const)('never invokes media or comment collection for Taobao %s',async feature=>{
+  const product={...context,sourceUrl:'https://detail.tmall.com/item.htm?id=123'};
+  await expect(collect(product,feature,normalizeSettings({}),{} as never,store(),new AbortController().signal,()=>{})).resolves.toEqual({properties:{},assets:[],body:''});
+  expect(mocks.page).not.toHaveBeenCalled();expect(mocks.discover).not.toHaveBeenCalled();
 });

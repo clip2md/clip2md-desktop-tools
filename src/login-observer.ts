@@ -2,6 +2,7 @@
 import type { SiteWindow } from './auth';
 import type { LoginPlatform } from './config';
 import { profileFromResponse, selfEndpoint, type AccountProfile } from './account-profile';
+import { parseZsxqResponse } from './adapters/zsxq';
 export type LoggedInProfile = Extract<AccountProfile, {state:'authenticated'}>;
 export interface LoginObserver { profile: Promise<LoggedInProfile | undefined>; dispose(): void; }
 interface DebugMessage { requestId?: string; response?: { url?: string; status?: number }; }
@@ -28,7 +29,7 @@ export async function observeLogin(win: SiteWindow, platform: LoginPlatform): Pr
             void (async () => {
                 const raw: unknown = await debuggerApi.sendCommand('Network.getResponseBody', { requestId: id });
                 if (!active || completed || !raw || typeof raw !== 'object' || !('body' in raw) || typeof raw.body !== 'string' || raw.body.length > 256 * 1024 || ('base64Encoded' in raw && raw.base64Encoded)) return;
-                const value = profileFromResponse(platform, JSON.parse(raw.body));
+                const value = profileFromResponse(platform, platform==='zsxq'?parseZsxqResponse(raw.body):JSON.parse(raw.body));
                 if (value.state === 'authenticated') { completed = true; complete(value); }
             })().catch(() => undefined);
         }

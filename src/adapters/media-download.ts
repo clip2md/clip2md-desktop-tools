@@ -22,6 +22,9 @@ export interface DownloadedMedia {
 export class MediaCandidateUnavailable extends Error {}
 interface Options {
   maxBytes?: number;
+  /** Only for validated topic attachments; bytes are still streamed and checked. */
+  fileName?: string;
+  expectedBytes?: number;
   timeoutMs?: number;
   /** Task-owned HTTP CONNECT proxy, used for sources unavailable by direct egress. */
   proxy?: string;
@@ -271,10 +274,10 @@ export async function downloadPublicMedia(
         const chunk = Buffer.from(value);
         bytes += chunk.length;
         if (bytes > maxBytes) throw new Error("站点媒体超过本次下载大小限制");
-        if (signature.length < 64)
+        if (signature.length < 4096)
           signature = Buffer.concat([
             signature,
-            chunk.subarray(0, 64 - signature.length),
+            chunk.subarray(0, 4096 - signature.length),
           ]);
         let output = chunk;
         if (decryptKey && !headPublished) {
@@ -311,12 +314,12 @@ export async function downloadPublicMedia(
         await handle.writeFile(head);
       }
       controller.signal.throwIfAborted();
-      const extension = mediaExtension(
+      const extension = options.fileName ? attachmentExtension(signature,options.fileName) : mediaExtension(
         decryptKey
           ? decryptWechatChannelsMediaBuffer(signature, decryptKey)
           : signature,
       );
-      if (!extension || !bytes || (total !== undefined && bytes !== total))
+      if (!extension || !bytes || (total !== undefined && bytes !== total) || (options.expectedBytes !== undefined && bytes !== options.expectedBytes))
         throw new Error("站点媒体格式或完整长度不正确");
       await handle.sync();
       await handle.close();
@@ -349,4 +352,15 @@ export async function downloadPublicMedia(
     if (handle) await handle.close();
     await fs.rm(staged, { force: true });
   }
+}
+
+/** Reject login/error documents even when the CDN labels them octet-stream. */
+export function attachmentExtension(head:Buffer,name:string):string {
+  const prefix=head.toString('utf8').trimStart();
+  if(/^(?:<!doctype\s+html|<html\b|<head\b|<body\b|<form\b|<script\b|<\?xml|<Error\b|\{\s*"(?:error|code|succeeded|message)"\s*:)/i.test(prefix))throw new Error('附件地址返回了登录页或错误响应');
+  const extension=name.match(/\.([a-z0-9]{1,12})$/i)?.[1].toLowerCase();
+  if(/^(?:AccessDenied|Forbidden|Unauthorized|Error:)/i.test(prefix))throw new Error('附件地址返回了错误响应');
+  if(extension==='pdf' && !prefix.startsWith('%PDF-'))throw new Error('PDF 附件格式无效');
+  if(['docx','xlsx','pptx','epub','zip'].includes(extension||'') && !head.subarray(0,2).equals(Buffer.from('PK')))throw new Error('压缩附件格式无效');
+  return extension || 'bin';
 }

@@ -10,6 +10,10 @@ import { normalizeWechatCode } from "./wechat-code";
 import { sourceTableMarkdown } from "./source-table";
 import { extractSitePage, localSite, siteAccessRequired } from "./sites";
 import type { MetricSnapshot } from "../note-properties";
+import { platformFor } from '../config';
+import { defuddlePage } from './defuddle-page';
+import { zsxqPage } from './zsxq';
+import { taobaoPage } from './taobao';
 export type ExtractedImageFetcher = (
   url: string,
   signal: AbortSignal,
@@ -192,7 +196,7 @@ export function htmlToMarkdown(
   return converter.turndown(document.body.innerHTML).trim();
 }
 
-function publicationDate(raw: string): string | undefined {
+export function publicationDate(raw: string): string | undefined {
   const match = raw
     .trim()
     .match(/^(\d{4})[-年](\d{1,2})[-月](\d{1,2})(?:日)?(?:T|\s|$)/);
@@ -212,7 +216,7 @@ function withoutRepeatedTitle(markdown: string, title: string): string {
 }
 
 /** A page wrapper's title/link is not an extracted article, however long it is. */
-function assertReadableBody(markdown: string, title: string): void {
+export function assertReadableBody(markdown: string, title: string): void {
   const normalize = (value: string) => value.replace(/\s+/g, " ").trim();
   const content = markdown
     .split("\n")
@@ -374,6 +378,9 @@ export function extractWebPage(
   options: { includeMetrics?: boolean } = {},
 ): ExtractedContent {
   assertArticleSource(url);
+  if (platformFor(url) === 'web') return defuddlePage({ url, html, videos: [] });
+  if (platformFor(url) === 'zsxq') return zsxqPage({url,html,videos:[]},url).content;
+  if (platformFor(url) === 'taobao') return taobaoPage({url,html,videos:[]},url).content;
   const document = new DOMParser().parseFromString(html, "text/html");
   // Readability resolves links before Turndown. DOMParser otherwise inherits
   // Obsidian's app:// origin (or the test runner origin), losing source links.

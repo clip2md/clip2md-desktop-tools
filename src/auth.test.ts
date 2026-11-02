@@ -166,6 +166,18 @@ describe("isolated native authorization", () => {
     expect(f.sessions.hasStoredAuthorization('web:example.com')).toBe(false);
     await f.sessions.close();
   });
+  it('restores parent-domain login cookies for an exact generic hostname without authorizing its siblings',async()=>{
+    const f=fixture();await f.sessions.setScope('scope-a');f.sessions.setWebDomains(['news.example.com']);
+    await f.sessions.login('web:news.example.com');
+    f.created[0].cookies.push({name:'session',value:'parent-cookie',domain:'.example.com',path:'/'});
+    await f.sessions.save('web:news.example.com',undefined,undefined,true);
+    await f.sessions.close();await f.sessions.setScope('scope-a');
+    expect(await f.sessions.authorizedCookies('web:news.example.com')).toEqual([expect.objectContaining({name:'session',value:'parent-cookie'})]);
+    expect(await f.sessions.cookieHeader('https://news.example.com/article')).toBe('session=parent-cookie');
+    expect(f.sessions.allowed('web:news.example.com','https://example.com/')).toBe(false);
+    expect(await f.sessions.cookieHeader('https://sibling.example.com/article')).toBe('');
+    await f.sessions.close();
+  });
   it('detects and restores Lizhi login storage from its allowed Taco subframe', async () => {
     const f = fixture(); await f.sessions.setScope('scope-a');
     const win = await f.sessions.login('lizhi');
@@ -657,4 +669,26 @@ describe("isolated native authorization", () => {
       expect(f.windows[0].destroyed).toBe(true); await f.sessions.close();
     }
   });
+});
+
+it('saves Taobao login only after manual confirmation, shares it with Tmall, restores it and revokes it', async () => {
+  const f = fixture(); await f.sessions.setScope('scope-a');
+  const win = await f.sessions.login('taobao');
+  f.created[0].cookies.push({name:'_m_h5_tk', value:'visitor', domain:'.taobao.com', path:'/'});
+  await expect(f.sessions.save('taobao',undefined,win,true)).rejects.toThrow('尚未检测');
+  f.created[0].cookies.push({name:'cookie2', value:'synthetic-session',domain:'.taobao.com',path:'/'},{name:'unb',value:'12345',domain:'.taobao.com',path:'/'});
+  await expect(f.sessions.save('taobao',undefined,win)).rejects.toThrow('尚未检测');
+  await f.sessions.save('taobao',undefined,win,true);
+  expect(await f.sessions.cookieLoginProfile('taobao')).toMatchObject({state:'authenticated'});
+  expect(f.sessions.targetFor('https://detail.tmall.com/item.htm?id=123')).toBe('taobao');
+  expect(f.sessions.allowed('taobao','https://login.taobao.com/member/login.jhtml')).toBe(true);
+  expect(f.sessions.allowed('taobao','https://detail.tmall.com.evil.test/item.htm?id=123')).toBe(false);
+  await f.sessions.close();
+  await f.sessions.setScope('scope-a');
+  await f.sessions.open('taobao',false);
+  expect(f.created[1].cookies.some(cookie => cookie.name === 'cookie2')).toBe(true);
+  await f.sessions.revoke('taobao');
+  expect(f.sessions.hasStoredAuthorization('taobao')).toBe(false);
+  expect(await f.sessions.cookieLoginProfile('taobao')).toBeUndefined();
+  await f.sessions.close();
 });

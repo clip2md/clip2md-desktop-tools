@@ -25,6 +25,9 @@ export interface ResolverProxy {
 }
 export interface ResolverProxyLimits {
   maxBytes?: number;
+  domains?: string[];
+  timeoutMs?: number;
+  maxConnections?: number;
 }
 const runtime: ResolverProxyRuntime = {
   lookup: lookupWithSignal,
@@ -81,7 +84,7 @@ export async function createResolverProxy(
   const abort = () => {
     void close();
   };
-  const timer = setTimeout(abort, 90000);
+  const timer = setTimeout(abort, limits.timeoutMs || 90000);
   server.maxConnections = 48;
   signal.addEventListener("abort", abort, { once: true });
   server.requestTimeout = 10000;
@@ -110,7 +113,7 @@ export async function createResolverProxy(
     )
       return deny(incoming, 407);
     if (
-      counters.connections > 40 ||
+      counters.connections > (limits.maxConnections || 40) ||
       active >= 4 ||
       counters.bytes >= maxBytes
     )
@@ -128,7 +131,7 @@ export async function createResolverProxy(
         target.hash ||
         !/^[a-z0-9.-]+$/.test(hostname) ||
         net.isIP(hostname) ||
-        ![
+        !(limits.domains || [
           "douyin.com",
           "iesdouyin.com",
           "bilibili.com",
@@ -146,7 +149,7 @@ export async function createResolverProxy(
           "google.com",
           "github.com",
           "githubusercontent.com",
-        ].some(
+        ]).some(
           (domain) => hostname === domain || hostname.endsWith("." + domain),
         )
       )

@@ -6,6 +6,8 @@ import { canonicalDouyinVideoUrl } from './adapters/sites';
 import { nowBeijingDateTime, formatBeijingDateTime } from './date-format';
 import { sourcePage } from "./page-source";
 import type { PlatformName } from "./config";
+import { ArticleAccessRequired } from './adapters/extract';
+import { zsxqComments } from './adapters/zsxq';
 export interface SourceComment {
   id: string;
   author: string;
@@ -173,6 +175,10 @@ export async function collectComments(
   sessions: SiteSessions,
   signal: AbortSignal,
 ): Promise<CommentResult> {
+  if(platform==='zsxq') {
+    const snapshot=await sourcePage(sessions,url,signal,()=>undefined,{commentLimit:limit}).catch((error:unknown)=>{if(error instanceof ArticleAccessRequired)throw new AuthorizationRequired(error.message);throw error;});
+    return {comments:zsxqComments(snapshot,url,limit),capturedAt:nowBeijingDateTime(),coverage:snapshot.zsxqCommentCoverage||'目标主题实际返回的评论样本，不代表全量评论或回复'};
+  }
   if(!['bilibili','douyin','xiaohongshu','zhihu'].includes(platform)) {
     // CSDN renders comments in a lazy side panel. Passing a no-op batch
     // handler enables sourcePage's bounded panel-opening/scroll path without

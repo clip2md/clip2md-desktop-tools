@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
-import { describe, expect, it, beforeEach } from "vitest";
-import { snapshotPage, workIdentityFromUrl } from "./page-source";
+import { describe, expect, it, beforeEach, vi } from "vitest";
+import { EventEmitter } from 'node:events';
+import { snapshotPage, sourcePage, workIdentityFromUrl } from "./page-source";
+import type { SiteSessions } from './auth';
 import { publicPageStates } from "./adapters/site-state";
 
 describe("snapshotPage", () => {
@@ -51,6 +53,38 @@ describe("snapshotPage", () => {
       expect.arrayContaining([expect.objectContaining({ note: expect.objectContaining({ desc: "正文" }) })]),
     );
   });
+  it('preserves generic JSON-LD and records computed hidden elements without collecting media',()=>{
+    document.head.innerHTML='<style>.invisible {display:none}</style><script type="application/ld+json">{"@type":"Article","author":"作者"}</script><script>window.privateToken="secret"</script>';
+    document.body.innerHTML='<main>正文</main><div class="invisible">请先登录</div><video src="/private.mp4"></video>';
+    const result=snapshotPage(true);
+    expect(result.html).toContain('application/ld+json');expect(result.html).not.toContain('privateToken');
+    expect(new DOMParser().parseFromString(result.html,'text/html').querySelector('.invisible')?.hasAttribute('hidden')).toBe(true);
+    expect(result.videos).toEqual([]);expect(result.webAccess).toEqual({loginForm:false,loginOverlay:false});
+  });
+  it('identifies a visible modal login gate without treating a cookie dialog as login',()=>{
+    const rectangles=vi.spyOn(Element.prototype,'getClientRects').mockReturnValue([{}] as unknown as DOMRectList);
+    try {
+      document.body.innerHTML='<main>正文</main><div role="dialog">接受 Cookie</div>';
+      expect(snapshotPage(true).webAccess?.loginOverlay).toBe(false);
+      document.body.innerHTML='<main>正文</main><div role="dialog">登录后继续阅读<input type="password"></div>';
+      expect(snapshotPage(true).webAccess).toEqual({loginForm:true,loginOverlay:true});
+    } finally {rectangles.mockRestore();}
+  });
+});
+
+it('passes the main-document HTTP status through the generic rendered snapshot',async()=>{
+  vi.useFakeTimers();
+  const url='https://example.com/private';
+  const web=Object.assign(new EventEmitter(),{getURL:()=>url,executeJavaScript:vi.fn(async()=>({url,html:'<title>登录</title>',videos:[]}))});
+  const win={webContents:web,loadURL:vi.fn(async()=>{web.emit('did-navigate',{},url,401);})};
+  const sessions={targetFor:()=> 'web:example.com',open:vi.fn(async()=>win),allowed:()=>true,release:vi.fn()};
+  try {
+    const result=sourcePage(sessions as unknown as SiteSessions,url,new AbortController().signal);
+    await vi.runAllTimersAsync();
+    expect(await result).toMatchObject({httpStatus:401});expect(sessions.release).toHaveBeenCalled();
+    expect(web.listenerCount('did-navigate')).toBe(0);
+    expect(web.executeJavaScript).toHaveBeenCalledWith(expect.stringContaining(')(true)'),false);
+  } finally {vi.useRealTimers();}
 });
 
 describe("workIdentityFromUrl", () => {
@@ -60,5 +94,65 @@ describe("workIdentityFromUrl", () => {
     ["https://www.bilibili.com/opus/1261621092485693461/", "1261621092485693461"],
   ])("selects the work identity from %s", (url, identity) => {
     expect(workIdentityFromUrl(url)).toBe(identity);
+  });
+});
+
+describe('Taobao local page loading',()=>{
+  const url='https://item.taobao.com/item.htm?id=123';
+  function pageFixture(challenge=false,changing=false){
+    let steps=0;
+    const snapshot={url,html:'<h1>商品</h1><div id="description">详情</div>',videos:[]};
+    const web=Object.assign(new EventEmitter(),{getURL:()=>url,executeJavaScript:vi.fn(async(script:string)=>{
+      if(script.includes('taobaoLoadStep'))return {ready:true,blocked:challenge,signature:changing?String(++steps):'stable'};
+      return snapshot;
+    })});
+    const win={webContents:web,loadURL:vi.fn(async()=>{})};
+    const sessions={targetFor:()=> 'taobao',open:vi.fn(async()=>win),allowed:()=>true,release:vi.fn()};
+    return {sessions,web};
+  }
+  it.each([false,true])('bounds lazy-loading with changing=%s and takes a DOM-only snapshot',async changing=>{
+    vi.useFakeTimers();
+    const f=pageFixture(false,changing);
+    try{
+      const pending=sourcePage(f.sessions as unknown as SiteSessions,url,new AbortController().signal);
+      await vi.runAllTimersAsync();
+      expect((await pending).url).toBe(url);
+      const calls=f.web.executeJavaScript.mock.calls;
+      expect(calls.filter(([script])=>script.includes('taobaoLoadStep')).length).toBeLessThanOrEqual(25);
+      expect(calls.at(-1)?.[0]).toContain(')(true)');
+      expect(f.sessions.release).toHaveBeenCalled();
+      expect(f.web.listenerCount('did-navigate')).toBe(0);
+    }finally{vi.useRealTimers();}
+  });
+  it('stops at a verification page and releases the hidden window',async()=>{
+    const f=pageFixture(true);
+    await expect(sourcePage(f.sessions as unknown as SiteSessions,url,new AbortController().signal)).rejects.toThrow('人工');
+    expect(f.web.executeJavaScript).toHaveBeenCalledOnce();expect(f.sessions.release).toHaveBeenCalled();
+  });
+  it('captures the rendered product when optional lazy loading reaches its budget',async()=>{
+    vi.useFakeTimers();const f=pageFixture(false,true);const budget=new AbortController();
+    const timeout=vi.spyOn(AbortSignal,'timeout').mockReturnValueOnce(budget.signal);
+    try {
+      const pending=sourcePage(f.sessions as unknown as SiteSessions,url,new AbortController().signal);
+      await vi.advanceTimersByTimeAsync(1000);budget.abort(new DOMException('budget','TimeoutError'));
+      await vi.runAllTimersAsync();
+      expect((await pending).url).toBe(url);
+      expect(f.web.executeJavaScript.mock.calls.at(-1)?.[0]).toContain(')(true)');
+      expect(f.sessions.release).toHaveBeenCalled();
+    }finally{timeout.mockRestore();vi.useRealTimers();}
+  });
+  it('rejects a search page before opening a capture session',async()=>{
+    const f=pageFixture();
+    await expect(sourcePage(f.sessions as unknown as SiteSessions,'https://s.taobao.com/search?q=test',new AbortController().signal)).rejects.toThrow('详情链接');
+    expect(f.sessions.open).not.toHaveBeenCalled();
+  });
+  it('cancels pending lazy loading and releases the session',async()=>{
+    vi.useFakeTimers();const f=pageFixture(false,true);const controller=new AbortController();
+    try{
+      const pending=sourcePage(f.sessions as unknown as SiteSessions,url,controller.signal);
+      const rejected=expect(pending).rejects.toThrow();
+      await vi.advanceTimersByTimeAsync(1000);controller.abort();await rejected;
+      expect(f.sessions.release).toHaveBeenCalled();
+    }finally{vi.useRealTimers();}
   });
 });

@@ -67,3 +67,11 @@ describe('homepage login network observation', () => {
         expect(f.debug.listenerCount('message')).toBe(0); observer.dispose(); expect(f.debug.detach).toHaveBeenCalledOnce();
     });
 });
+it('confirms Knowledge Planet only from its own self response, retaining long user IDs',async()=>{
+    const f=fixture(),observer=await observeLogin(f.window,'zsxq');
+    f.debug.sendCommand.mockResolvedValue({body:'{"succeeded":true,"resp_data":{"user":{"uid":123456789123456789,"name":"星球用户"}}}'});
+    f.response('https://api.zsxq.com.evil.example/v3/users/self');
+    expect(f.debug.sendCommand.mock.calls.filter(([method])=>method==='Network.getResponseBody')).toHaveLength(0);
+    f.response('https://api.zsxq.com/v3/users/self');
+    await expect(observer.profile).resolves.toEqual({state:'authenticated',nickname:'星球用户'});observer.dispose();
+});
