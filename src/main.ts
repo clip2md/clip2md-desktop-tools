@@ -175,6 +175,7 @@ export default class DesktopTools extends Plugin {
         this.app.saveLocalStorage(`clip2md-tools-${device}`, { ffmpeg, ytdlp, whisper, whisperModel, language, asrTimeoutMinutes });
         await this.saveData(shared);
         this.refreshSettingsViews();
+        this.updateStatus(this.status);
     }
     async onExternalSettingsChange(): Promise<void> {
         const raw: unknown = await this.loadData();
@@ -243,6 +244,7 @@ export default class DesktopTools extends Plugin {
             return;
         }
         this.logger = new LocalLogger(this.app, "clipmd-desktop-tools", this.manifest.version);
+        this.register(this.logger.captureUnhandled());
         this.logger.log("plugin.start");
         this.retainedConfig = new PersistentConfig(this.app.vault.adapter, this.app.vault.configDir, "clipmd-desktop-tools", (value) => {
             const shared: Record<string, unknown> = { ...normalizeSettings(value) };
@@ -261,7 +263,7 @@ export default class DesktopTools extends Plugin {
             return legacy;
         })
             .catch((error: unknown) => {
-            this.logger?.log("config.recovery.failed", {}, "error");
+            this.logger?.log("config.recovery.failed", {}, "error", undefined, error);
             new Notice("保留配置无法恢复，已保留原文件，请检查备份后重新启用扩展", 15000);
             throw error instanceof Error ? error : new Error("配置恢复失败");
         });
@@ -284,6 +286,8 @@ export default class DesktopTools extends Plugin {
             website: "https://clip2.md",
             enabled: () => ({ clipmd: !!this.bridge, "clipmd-desktop-tools": true }),
             tools: () => this.toolVersions,
+            feedbackInfo: () => this.feedbackSnapshot(),
+            flushes: () => this.bridge?.flushLogs ? { clipmd: () => this.bridge!.flushLogs!() } : {},
             delegate: () => {
                 if (!this.bridge?.openFeedback)
                     return false;
@@ -315,7 +319,7 @@ export default class DesktopTools extends Plugin {
                 this.logger?.log("auth.browser_cookies", { platform, count: cookies.length, available: cookies.length > 0 });
                 return cookies;
             } catch (error) {
-                this.logger?.log("auth.browser_cookies_failed", { platform, code: error instanceof Error ? error.name : "unknown" }, "warn");
+                this.logger?.log("auth.browser_cookies_failed", { platform, code: error instanceof Error ? error.name : "unknown" }, "warn", undefined, error);
                 return [];
             }
         });
@@ -447,6 +451,7 @@ export default class DesktopTools extends Plugin {
     }
     onunload(): void {
         this.logger?.log("plugin.stop");
+        this.logger?.stop();
         this.diagnostics?.stop();
         this.alive = false;
         this.favoriteModal?.close();
@@ -503,7 +508,13 @@ export default class DesktopTools extends Plugin {
                 renderSettings: (container: HTMLElement) => this.renderSettings(container),
                 prepareTemplateValues: (context: LocalRetryContext, names: string[]) => this.prepareTemplateValues(context, names),
                 prepareLocalRetry: (context: LocalRetryContext) => this.prepareLocalRetry(context),
-                capabilities: ["update-pause-v1", "desktop-control-v1", "local-retry-v1", "local-template-v1"],
+                capabilities: ["client-info-v1", "update-pause-v1", "desktop-control-v1", "local-retry-v1", "local-template-v1"],
+                getClientInfo: async () => ({ supported: true, enabled: this.manuallyEnabled, runtimeVersion: this.manifest.version,
+                    deployment: this.integrated ? "integrated" : "companion", platformEnabled: { ...this.settings.platformEnabled },
+                    platforms: Object.fromEntries(Object.entries(this.settings.platforms).map(([platform, features]) => [platform, { ...features }])),
+                    tools: { ...this.toolVersions }, toolStates: { ffmpeg: this.toolVersions.ffmpegCapabilities === 'verified', ytdlp: this.toolVersions.ytdlpCapabilities === 'verified', whisper: this.asrReady } }),
+                getFeedbackInfo: () => this.feedbackSnapshot(),
+                flushLogs: async () => { await this.logger?.flush(); },
                 tools: this.toolVersions,
                 prepareUpdate: async () => {
                     this.updatePaused = true;
@@ -523,6 +534,18 @@ export default class DesktopTools extends Plugin {
                 message,
                 openSettings: () => this.openSettings(),
             });
+    }
+    private async feedbackSnapshot(): Promise<import('./companion-protocol').DesktopFeedbackSnapshot> {
+        const authorization: import('./companion-protocol').DesktopFeedbackSnapshot['authorization'] = {};
+        for (const platform of Object.keys(this.settings.platformEnabled) as PlatformName[]) {
+            try {
+                const waiting = this.state?.jobs.some(job => job.context.bindingScope === this.scope && job.status === 'waiting-auth' && platformFor(job.context.sourceUrl) === platform);
+                authorization[platform] = !this.scope ? 'unknown' : waiting ? 'needs-authorization' : platform === 'web' ? 'unknown' : this.sessions?.hasStoredAuthorization(platform) ? 'stored' : 'not-authorized';
+            } catch { authorization[platform] = 'unknown'; }
+        }
+        const summary: Record<string, number> = {};
+        for (const job of this.state?.jobs || []) if (job.context.bindingScope === this.scope) summary[job.status] = (summary[job.status] || 0) + 1;
+        return { authorization, summary };
     }
     private valuesPath(context: {
         bindingScope: string;
@@ -738,6 +761,7 @@ export default class DesktopTools extends Plugin {
                 this.drain();
             } finally { await fs.rm(work, { recursive: true, force: true }); }
         })().catch((error: unknown) => {
+            this.logger?.log("tools.prepare_failed", {}, "error", undefined, error);
             this.asrReady = false;
             if (controller.signal.aborted || !this.alive || !this.manuallyEnabled) return;
             this.setupError = error instanceof Error ? error.message : '工具准备失败';
@@ -1223,6 +1247,7 @@ export default class DesktopTools extends Plugin {
                 continue;
             }
             const operation = crypto.randomUUID();
+            const startedAt = Date.now();
             const controller = new AbortController();
             this.active = controller;
             const timeout = window.setTimeout(() => controller.abort(new Error("本地素材任务超过时间上限")), this.settings.timeoutMinutes * 60000);
@@ -1369,6 +1394,7 @@ export default class DesktopTools extends Plugin {
             }
             catch (error) {
                 failure = error;
+                this.logger?.log("queue.failed", { taskId: job.context.taskId, feature: job.feature, attempt: job.attempts, reason: localFailureReason(error) }, "error", operation, error);
                 const retryCount = job.retryCount || 0;
                 const commentNeedsAuthorization = job.feature === "comments" &&
                     commentsNeedAuthorization(error);
@@ -1416,6 +1442,8 @@ export default class DesktopTools extends Plugin {
                     taskId: job.context.taskId,
                     feature: job.feature,
                     status: job.status,
+                    durationMs: Date.now() - startedAt,
+                    attempt: job.attempts,
                     message: job.message
                         .replace(/https?:\/\/\S+/gi, "[url]")
                         .replace(/(?:\/Users\/|[A-Za-z]:[\\/])\S+/g, "[path]")
@@ -1624,7 +1652,7 @@ export default class DesktopTools extends Plugin {
                             }
                         }
                         if (!controller.signal.aborted && !closed) {
-                            this.logger?.log('auth.save.failed', { platform:diagnosticPlatform }, 'warn');
+                            this.logger?.log('auth.save.failed', { platform:diagnosticPlatform }, 'warn', undefined, error);
                             new Notice(error instanceof Error ? error.message : '授权保存失败，请检查原站登录状态');
                         }
                     } finally { saving = false; }
@@ -1659,7 +1687,7 @@ export default class DesktopTools extends Plugin {
                 }
             });
         } catch (error) {
-            this.logger?.log('auth.window.failed', { platform:diagnosticPlatform, code: error instanceof LoginWindowError ? error.code : 'LOGIN_UNAVAILABLE' }, 'warn');
+            this.logger?.log('auth.window.failed', { platform:diagnosticPlatform, code: error instanceof LoginWindowError ? error.code : 'LOGIN_UNAVAILABLE' }, 'warn', undefined, error);
             new Notice(error instanceof Error ? error.message : "无法打开原站授权窗口");
             return false;
         } finally { observer?.dispose(); }

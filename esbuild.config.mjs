@@ -19,6 +19,7 @@ const result = await esbuild.build({
   target: "es2022",
   external: ["obsidian", "electron", "node:*"],
   minify: true,
+  keepNames: true,
   legalComments: "eof",
   metafile: true,
   outfile: path.join(out, "main.js"),

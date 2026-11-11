@@ -15,19 +15,36 @@ describe('favorites response fixtures', () => {
         ] } });
         expect(page.items).toHaveLength(1); expect(page.items[0].url).toContain(`explore/${NOTE}?xsec_token=signed-access`); expect(page.cursor).toBe(NOTE);
     });
-    it('distinguishes Douyin videos from galleries and excludes private works and live streams', () => {
+    it('imports only Douyin videos and excludes galleries, private works, and live streams', () => {
         const page = parseFavoritePage('douyin', { status_code: 0, has_more: 0, cursor: 10, aweme_list: [
             { aweme_id: '7000000000000000001', aweme_type: 0, desc: '视频', author: { nickname: '作者' } },
             { aweme_id: '7000000000000000002', aweme_type: 68, desc: '图文', images: [{}] },
             { aweme_id: '7000000000000000003', aweme_type: 0, status: { item_is_private: true } },
             { aweme_id: '7000000000000000004', aweme_type: 101 },
         ] });
-        expect(page.items.map(item => item.url)).toEqual(['https://www.douyin.com/video/7000000000000000001', 'https://www.douyin.com/note/7000000000000000002']); expect(page.skipped).toBe(2);
+        expect(page.items.map(item => item.url)).toEqual(['https://www.douyin.com/video/7000000000000000001']); expect(page.skipped).toBe(3);
+    });
+    it('accepts the current Douyin mix collection response when it embeds works', () => {
+        const page = parseFavoritePage('douyin', { status_code: 0, has_more: 0, cursor: 0, mix_infos: [{ mix_id: '1', item_list: [{ aweme_id: '7000000000000000001', aweme_type: 0, desc: '合集视频' }] }] });
+        expect(page.items).toHaveLength(1);
+        expect(page.items[0].url).toBe('https://www.douyin.com/video/7000000000000000001');
+    });
+    it('uses mix collection works when the response also contains an empty aweme list', () => {
+        const page = parseFavoritePage('douyin', {
+            status_code: 0, has_more: 0, cursor: 0, aweme_list: [],
+            mix_infos: [{ mix_id: '1', item_list: [{ aweme_id: '7000000000000000002', aweme_type: 0, desc: '合集视频' }] }],
+        });
+        expect(page.items.map(item => item.id)).toEqual(['7000000000000000002']);
     });
     it('accepts only an exact favorites endpoint for the self account, never recommendations', () => {
         expect(favoriteEndpoint('xiaohongshu', `https://edith.xiaohongshu.com/api/sns/web/v1/note/collect/page?user_id=${NOTE}`, NOTE)).toBe(true);
+        expect(favoriteEndpoint('xiaohongshu', `https://edith.xiaohongshu.com/api/sns/web/v2/note/collect/page?userId=${NOTE}`, NOTE)).toBe(true);
+        expect(favoriteEndpoint('xiaohongshu', 'https://edith.xiaohongshu.com/api/sns/web/v2/note/collect/page?num=30&cursor=', NOTE)).toBe(true);
         expect(favoriteEndpoint('xiaohongshu', 'https://edith.xiaohongshu.com/api/sns/web/v1/note/collect/page?user_id=other', NOTE)).toBe(false);
+        expect(favoriteEndpoint('xiaohongshu', `https://edith.xiaohongshu.com/api/sns/web/v2/note/collect/page?user_id=${NOTE}&userId=other`, NOTE)).toBe(false);
+        expect(favoriteEndpoint('xiaohongshu', `https://edith.xiaohongshu.com/api/sns/web/v2/note/collect/page?userId=${NOTE}&userId=other`, NOTE)).toBe(false);
         expect(favoriteEndpoint('douyin', 'https://www.douyin.com/aweme/v1/web/aweme/listcollection/', 'self')).toBe(true);
+        expect(favoriteEndpoint('douyin', 'https://www.douyin.com/aweme/v1/web/mix/listcollection/?cursor=0', 'self')).toBe(true);
         for (const url of ['https://www.douyin.com/aweme/v1/web/aweme/favorite/', 'https://www.douyin.com/aweme/v1/web/aweme/post/', 'https://www.douyin.com.evil.test/aweme/v1/web/aweme/listcollection/']) expect(favoriteEndpoint('douyin', url, 'self')).toBe(false);
     });
     it('reports auth errors and rejects malformed or stalled pagination instead of false success', () => {
@@ -68,7 +85,7 @@ describe('Bilibili authenticated pagination', () => {
 });
 
 describe('signed favorites renderer', () => {
-    function fixture(platform: 'xiaohongshu' | 'douyin', fail = false) {
+    function fixture(platform: 'xiaohongshu' | 'douyin', fail = false, includeUserId = true, scriptFailures = 0) {
         let listener: ((event: unknown, method: string, params: unknown) => void) | undefined;
         let current = '', sequence = 0, advance = 0;
         const bodies = new Map<string, unknown>();
@@ -80,7 +97,9 @@ describe('signed favorites renderer', () => {
         const payload = (more: boolean, id: string) => platform === 'xiaohongshu'
             ? { code: 0, success: true, data: { has_more: more, cursor: id, notes: [{ note_id: id, display_title: '收藏笔记' }] } }
             : { status_code: 0, has_more: more ? 1 : 0, cursor: Number(id), aweme_list: [{ aweme_id: id, aweme_type: 0, desc: '收藏视频' }] };
-        const endpoint = platform === 'xiaohongshu' ? `https://edith.xiaohongshu.com/api/sns/web/v2/note/collect/page?user_id=${NOTE}` : 'https://www.douyin.com/aweme/v1/web/aweme/listcollection/';
+        const endpoint = platform === 'xiaohongshu'
+            ? `https://edith.xiaohongshu.com/api/sns/web/v2/note/collect/page?${includeUserId ? `userId=${NOTE}&` : ''}num=30&cursor=`
+            : 'https://www.douyin.com/aweme/v1/web/aweme/listcollection/';
         const debug = { attach: vi.fn(), detach: vi.fn(), on: vi.fn((_name, fn) => { listener = fn; }), removeListener: vi.fn(), sendCommand: vi.fn(async (command, params) => command === 'Network.getResponseBody' ? { body: JSON.stringify(bodies.get(params.requestId)), base64Encoded: false } : {}) };
         const window = { isDestroyed: () => false, loadURL: vi.fn(async (url: string) => {
             current = url;
@@ -92,18 +111,31 @@ describe('signed favorites renderer', () => {
                 emit(endpoint, payload(true, platform === 'xiaohongshu' ? NOTE : '123'), fail ? 401 : 200);
             }
         }), webContents: { debugger: debug, getURL: () => current, executeJavaScript: vi.fn(async () => {
+            if (scriptFailures > 0) { scriptFailures--; throw new Error('Script failed to execute, this normally means an error was thrown.'); }
             if (++advance === 1) emit(endpoint, payload(false, platform === 'xiaohongshu' ? '1123456789abcdef01234567' : '124'));
             return true;
         }) } };
         const release = vi.fn();
-        return { sessions: { open: async () => window, allowed: () => true, release } as unknown as SiteSessions, release, debug };
+        return { sessions: { open: async () => window, allowed: () => true, release } as unknown as SiteSessions, release, debug, window };
     }
     it.each(['xiaohongshu', 'douyin'] as const)('reads %s pages to explicit end and excludes recommendations', async platform => {
         const f = fixture(platform), pages: FavoriteProgress[] = [];
         await loadFavoriteItems(platform, f.sessions, new AbortController().signal, async page => { pages.push(page); });
         expect(pages).toHaveLength(2); expect(pages.map(page => page.page.hasMore)).toEqual([true, false]);
+        if (platform === 'xiaohongshu') expect(f.window.loadURL).toHaveBeenCalledWith(`https://www.xiaohongshu.com/user/profile/${NOTE}?tab=fav&subTab=note`);
         expect(pages.flatMap(page => page.page.items).some(item => item.id === '999' || item.id === 'ffffffffffffffffffffffff')).toBe(false);
         expect(f.debug.detach).toHaveBeenCalledOnce(); expect(f.debug.removeListener).toHaveBeenCalled(); expect(f.release).toHaveBeenCalled();
+    });
+    it('reads XHS favorites when the browser omits user_id from the exact collect endpoint', async () => {
+        const f = fixture('xiaohongshu', false, false), pages: FavoriteProgress[] = [];
+        await loadFavoriteItems('xiaohongshu', f.sessions, new AbortController().signal, async page => { pages.push(page); });
+        expect(pages).toHaveLength(2);
+        expect(pages.flatMap(page => page.page.items)).toHaveLength(2);
+    });
+    it('retries a renderer script while the XHS profile is still hydrating', async () => {
+        const f = fixture('xiaohongshu', false, true, 1), pages: FavoriteProgress[] = [];
+        await loadFavoriteItems('xiaohongshu', f.sessions, new AbortController().signal, async page => { pages.push(page); });
+        expect(pages).toHaveLength(2);
     });
     it('fails explicitly on expired login and releases the owned window', async () => {
         const f = fixture('xiaohongshu', true);

@@ -149,7 +149,7 @@ describe("local diagnostics", () => {
       taskId: 1,
     });
   });
-  it("collects exactly the 24-hour window from both plugins and declares missing/truncated coverage", async () => {
+  it("collects exactly the 72-hour window from both plugins and declares missing/truncated coverage", async () => {
     const io = new MemoryIO(),
       a = app(io),
       logger = new LocalLogger(a, "clipmd", "1.0.22");
@@ -157,14 +157,19 @@ describe("local diagnostics", () => {
     await logger.flush();
     const file = readLog(await io.read(logger.path));
     const now = Date.now(),
-      start = now - 86400000;
+      start = now - 3 * 86400000;
     file.entries = [start - 1, start, now, now + 1].map((t) => ({
       ...file.entries[0],
       time: new Date(t).toISOString(),
     }));
     file.discardedAt = new Date(start).toISOString();
     await io.write(logger.path, JSON.stringify(file));
-    const report = await diagnosticReport(a, logger, { clipmd: true }, {}, now);
+    const report = await diagnosticReport(a, logger, { clipmd: true }, {
+      ffmpeg: "ffmpeg version 7.1 built in /Users/private",
+      ytdlp: "2026.10.21",
+      whisper: "whisper.cpp version: /Users/private",
+    }, now);
+    expect(report.environment.tools).toEqual({ ffmpeg: "7.1", ytdlp: "2026.10.21" });
     expect(report.logs[0].entries).toHaveLength(2);
     expect(report.logs[0].state).toBe("truncated");
     expect(report.logs[1].state).toBe("missing");
@@ -184,7 +189,7 @@ describe("local diagnostics", () => {
       logger = new LocalLogger(app(io), "clipmd", "1.0.22");
     io.fail = true;
     logger.log("plugin.start");
-    await expect(logger.flush()).resolves.toBeUndefined();
+    await expect(logger.flush()).rejects.toThrow("disk error");
     expect(LOG_LIMIT).toBe(10 * 1024 * 1024);
   });
 });

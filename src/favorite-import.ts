@@ -41,21 +41,24 @@ function item(platform: FavoritePlatform, raw: unknown): FavoriteItem | undefine
         const id = text(row.bvid) || (Number.isSafeInteger(row.id) && Number(row.id) > 0 ? `av${Number(row.id)}` : '');
         url = `https://www.bilibili.com/video/${id}`; title = text(row.title); author = text(object(row.upper).name); thumbnail = row.cover; collected = row.fav_time;
     } else if (platform === 'xiaohongshu') {
-        if (row.model_type && row.model_type !== 'note' || unavailable(card)) return;
-        const id = text(row.note_id || row.noteId || row.id || card.note_id || card.noteId);
+        if (row.model_type && row.model_type !== 'note' || row.modelType && row.modelType !== 'note' || unavailable(card)) return;
+        const id = text(row.note_id || row.noteId || row.id || card.note_id || card.noteId || card.id);
         if (!/^[a-f0-9]{24}$/i.test(id)) return;
         url = `https://www.xiaohongshu.com/explore/${id}`;
-        const token = text(row.xsec_token || row.xsecToken || card.xsec_token);
+        const token = text(row.xsec_token || row.xsecToken || card.xsec_token || card.xsecToken);
         if (token) url += `?xsec_token=${encodeURIComponent(token)}`;
         title = text(card.display_title || card.displayTitle || card.title || row.display_title || row.displayTitle || row.title);
         author = text(object(card.user || row.user).nickname);
         thumbnail = object(card.cover || row.cover).url_default || object(card.cover || row.cover).urlDefault || object(card.cover || row.cover).url;
-        collected = row.collect_time;
+        collected = row.collect_time || row.collected_time || row.collectedTime;
     } else {
         const id = typeof row.aweme_id === 'string' ? row.aweme_id : '';
-        if (!/^[1-9]\d{0,19}$/.test(id) || ![0, 4, 68, 150].includes(Number(row.aweme_type))) return;
-        const gallery = Array.isArray(row.images) && row.images.length > 0 || Number(row.aweme_type) === 68;
-        url = `https://www.douyin.com/${gallery ? 'note' : 'video'}/${id}`;
+        const awemeType = Number(row.aweme_type ?? row.awemeType);
+        // 收藏导入只接受视频作品。图文收藏使用 aweme_type=68 or an
+        // images array and must not be converted into a /note/ task here.
+        if (!/^[1-9]\d{0,19}$/.test(id) || ![0, 4, 150].includes(awemeType)
+            || awemeType === 68 || Array.isArray(row.images) && row.images.length > 0) return;
+        url = `https://www.douyin.com/video/${id}`;
         title = text(row.desc); author = text(object(row.author).nickname);
         const covers = object(object(row.video).cover).url_list;
         thumbnail = Array.isArray(covers) ? covers[0] : undefined;
@@ -71,12 +74,23 @@ export function parseFavoritePage(platform: FavoritePlatform, payload: unknown):
     const code = platform === 'douyin' ? root.status_code : root.code;
     if (code === -101 || code === -100 || code === 8) throw new AuthorizationRequired('原站登录已失效，请重新登录后读取收藏');
     if (code !== 0 || platform === 'xiaohongshu' && root.success !== true) throw new Error('原站收藏接口暂不可用，请在原站完成验证后重试');
-    const rows = platform === 'bilibili' ? data.medias : platform === 'xiaohongshu' ? data.notes : data.aweme_list;
+    const candidates = platform === 'douyin' ? [data.aweme_list, data.awemeList, data.mix_infos] : [];
+    const rows = platform === 'bilibili' ? data.medias : platform === 'xiaohongshu' ? data.notes
+        : candidates.find(value => Array.isArray(value) && value.length > 0) ?? candidates.find(value => Array.isArray(value));
     const more = data.has_more ?? data.hasMore;
     if (!Array.isArray(rows) && rows !== null || ![true, false, 0, 1].includes(more as boolean | number)) throw new Error('收藏分页格式发生变化，读取已停止');
-    const source = Array.isArray(rows) ? rows : [];
+    const source = Array.isArray(rows)
+        ? platform === 'douyin' && rows === data.mix_infos
+            ? rows.flatMap(row => {
+                const value = object(row);
+                const items = Array.isArray(value.item_list) ? value.item_list : Array.isArray(value.aweme_list) ? value.aweme_list : [];
+                return items as unknown[];
+            })
+            : rows
+        : [];
     const items = source.map(row => item(platform, row)).filter((row): row is FavoriteItem => !!row);
-    const cursorValue = data.cursor ?? data.max_cursor ?? (platform === 'xiaohongshu' ? object(source.at(-1)).id ?? object(source.at(-1)).note_id : undefined);
+    const cursorValue = data.cursor ?? data.str_cursor ?? data.strCursor ?? data.max_cursor
+        ?? (platform === 'xiaohongshu' ? object(source.at(-1)).id ?? object(source.at(-1)).note_id ?? object(source.at(-1)).noteId : undefined);
     const cursor = typeof cursorValue === 'string' || typeof cursorValue === 'number' && Number.isSafeInteger(cursorValue) ? String(cursorValue) : '';
     const hasMore = more === true || more === 1;
     if (hasMore && (!source.length || platform !== 'bilibili' && !cursor)) throw new Error('收藏分页未推进，读取已停止');
@@ -86,9 +100,16 @@ export function favoriteEndpoint(platform: FavoritePlatform, value: string, self
     try {
         const url = new URL(value);
         if (url.protocol !== 'https:' || url.username || url.password || url.port) return false;
-        if (platform === 'xiaohongshu') return ['edith.xiaohongshu.com', 'www.xiaohongshu.com'].includes(url.hostname)
-            && ['/api/sns/web/v1/note/collect/page', '/api/sns/web/v2/note/collect/page'].includes(url.pathname) && url.searchParams.get('user_id') === selfId;
-        return platform === 'douyin' && url.hostname === 'www.douyin.com' && url.pathname === '/aweme/v1/web/aweme/listcollection/';
+        if (platform === 'xiaohongshu') {
+            if (!['edith.xiaohongshu.com', 'www.xiaohongshu.com'].includes(url.hostname)
+                || !['/api/sns/web/v1/note/collect/page', '/api/sns/web/v2/note/collect/page'].includes(url.pathname)) return false;
+            // The web client has shipped snake_case, camelCase, and session-
+            // inferred forms. Bind either explicit parameter name to selfId.
+            const accountParams = ['user_id', 'userId'].filter(name => url.searchParams.has(name));
+            return accountParams.length === 0 || accountParams.every(name => url.searchParams.getAll(name).every(value => value === selfId));
+        }
+        return platform === 'douyin' && url.hostname === 'www.douyin.com'
+            && ['/aweme/v1/web/aweme/listcollection/', '/aweme/v1/web/mix/listcollection/'].includes(url.pathname);
     } catch { return false; }
 }
 async function delay(ms: number, signal: AbortSignal): Promise<void> {
@@ -109,8 +130,66 @@ export function advanceFavoritePage(activate = false): boolean {
     if (activate && tab instanceof HTMLElement && tab.getAttribute('aria-selected') !== 'true' && !/active|selected/.test(tab.className)) tab.click();
     const scrollers = [document.scrollingElement, ...Array.from(document.querySelectorAll('main,[class*="scroll"],[class*="content"],[class*="container"]'))]
         .filter((el): el is HTMLElement => el instanceof HTMLElement && visible(el) && el.scrollHeight > el.clientHeight + 4);
-    for (const el of scrollers) { el.scrollTop = el.scrollHeight; el.dispatchEvent(new Event('scroll', { bubbles: true })); }
+    for (const el of scrollers) { el.scrollTop = Math.min(el.scrollTop + Math.max(240, el.clientHeight * 0.8), el.scrollHeight); el.dispatchEvent(new Event('scroll', { bubbles: true })); }
     return tab instanceof HTMLElement;
+}
+/** Projects only note/video links rendered on the authenticated Douyin tab. */
+function readRenderedDouyinPageScript(): string {
+    return `(
+      async () => {
+        const all = new Map();
+        const visible = el => el instanceof HTMLElement && el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0;
+        const collect = () => {
+          for (const link of Array.from(document.querySelectorAll('a[href]'))) {
+            let url;
+            try { url = new URL(link.href); } catch { continue; }
+            const cover = link.querySelector('img[alt]');
+            if (url.hostname !== 'www.douyin.com' || !/^\\/video\\/[1-9]\\d{0,19}\\/?$/.test(url.pathname)
+                || !cover?.alt?.trim() || !/(?:PackSourceEnum_COLLECTION|sc=cover)/i.test(cover.currentSrc || cover.src || '')) continue;
+            all.set(url.href, { url: url.href, title: cover.alt.replace(/\\s+/g, ' ').trim().slice(0, 240) });
+          }
+        };
+        let stableBottom = 0, previousSignature = '', previousMetrics = '';
+        let sawContainer = false;
+        for (let attempt = 0; attempt < 80; attempt++) {
+          collect();
+          const containers = [document.scrollingElement, ...Array.from(document.querySelectorAll('[data-e2e="scroll-list"],main,[class*="scroll"],[class*="content"],[class*="container"]'))]
+            .filter(visible);
+          if (containers.length) sawContainer = true;
+          const scrollers = containers.filter(el => el.scrollHeight > el.clientHeight + 4);
+          let moved = false;
+          for (const el of scrollers) {
+            const before = el.scrollTop;
+            el.scrollTop = Math.min(before + Math.max(240, el.clientHeight * 0.8), el.scrollHeight);
+            el.dispatchEvent(new Event('scroll', { bubbles: true }));
+            moved ||= el.scrollTop > before + 1;
+          }
+          const signature = [...all.keys()].join('|');
+          const metrics = scrollers.map(el => String(Math.round(el.scrollTop)) + '/' + String(Math.round(el.scrollHeight)) + '/' + String(Math.round(el.clientHeight))).join('|');
+          const unchanged = signature === previousSignature && metrics === previousMetrics;
+          if (!moved && unchanged && sawContainer) stableBottom++; else stableBottom = 0;
+          previousSignature = signature; previousMetrics = metrics;
+          if (stableBottom >= 8) break;
+          await new Promise(resolve => window.setTimeout(resolve, 500));
+        }
+        collect();
+        const urls = [...all.values()];
+        const signature = urls.map(value => value.url).join('|');
+        return { urls, ready: stableBottom >= 8, signature };
+      }
+    )()`;
+}
+function advanceFavoritePageScript(activate: boolean): string {
+    return `(() => {
+        const visible = el => el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0;
+        const tab = Array.from(document.querySelectorAll('button,[role=tab],a,span'))
+            .find(el => visible(el) && el.textContent?.trim() === '收藏');
+        if (${JSON.stringify(activate)} && tab instanceof HTMLElement && tab.getAttribute('aria-selected') !== 'true' && !/active|selected/.test(tab.className)) tab.click();
+        const scrollers = [document.scrollingElement, ...Array.from(document.querySelectorAll('[data-e2e="scroll-list"],main,[class*="scroll"],[class*="content"],[class*="container"]'))]
+            .filter(el => el instanceof HTMLElement && visible(el) && el.scrollHeight > el.clientHeight + 4);
+        for (const el of scrollers) { el.scrollTop = Math.min(el.scrollTop + Math.max(240, el.clientHeight * 0.8), el.scrollHeight); el.dispatchEvent(new Event('scroll', { bubbles: true })); }
+        return tab instanceof HTMLElement;
+    })()`;
 }
 interface FavoriteWebContents {
     getURL(): string;
@@ -130,7 +209,26 @@ export async function loadFavoriteItems(platform: FavoritePlatform, sessions: Si
     const run = async (script: string) => {
         signal.throwIfAborted();
         if (!sessions.allowed(platform, web.getURL())) throw new Error('收藏页面已离开原站，读取已停止');
-        return withAbort(web.executeJavaScript(script, false), AbortSignal.any([signal, AbortSignal.timeout(20000)]));
+        if (platform !== 'bilibili') {
+            const evaluated = object(await withAbort(web.debugger.sendCommand('Runtime.evaluate', {
+                expression: script, awaitPromise: true, returnByValue: true,
+            }), AbortSignal.any([signal, AbortSignal.timeout(20000)])));
+            if (Object.prototype.hasOwnProperty.call(evaluated, 'result')) {
+                const exception = object(evaluated.exceptionDetails);
+                if (Object.keys(exception).length) throw new Error(text(object(exception.exception).description) || '原站页面脚本执行失败');
+                return object(evaluated.result).value;
+            }
+        }
+        for (let attempt = 0; ; attempt++) {
+            try {
+                return await withAbort(web.executeJavaScript(script, false), AbortSignal.any([signal, AbortSignal.timeout(20000)]));
+            } catch (error) {
+                const failure = error instanceof Error ? error : new Error('收藏页面脚本执行失败');
+                if (signal.aborted || attempt >= 3 || !/Script failed to execute|(?:frame|context).*(?:destroy|navigat)|收藏页面脚本执行失败/i.test(failure.message)) throw failure;
+                await delay(350, signal);
+                if (!sessions.allowed(platform, web.getURL())) throw failure;
+            }
+        }
     };
     const navigate = async (url: string) => { signal.throwIfAborted(); await withAbort(win.loadURL(url), AbortSignal.any([signal, AbortSignal.timeout(30000)])); };
     try {
@@ -168,9 +266,9 @@ async function readSignedFavorites(platform: Exclude<FavoritePlatform, 'bilibili
     run: (script: string) => Promise<unknown>, navigate: (url: string) => Promise<void>, signal: AbortSignal,
     onPage: (progress: FavoriteProgress) => Promise<void>): Promise<void> {
     const web = win.webContents as FavoriteWebContents;
-    let selfId = '', failure: Error | undefined, reading = false, finished = false, pages = 0;
+    let selfId = '', failure: Error | undefined, reading = false, finished = false, pages = 0, renderedSignature = '';
     const pending = new Map<string, { self: boolean; url: string }>(), received: FavoritePage[] = [], cursors = new Set<string>();
-    let processing: Promise<void> = Promise.resolve();
+    const processing = new Set<Promise<void>>();
     const listener = (_event: unknown, method: string, params: { requestId: string; response?: { url: string; status: number } }) => {
         if (signal.aborted) return;
         if (method === 'Network.responseReceived' && params.response) {
@@ -191,8 +289,25 @@ async function readSignedFavorites(platform: Exclude<FavoritePlatform, 'bilibili
         }
         if (method !== 'Network.loadingFinished') return;
         const request = pending.get(params.requestId); if (!request) return; pending.delete(params.requestId);
-        processing = processing.then(async () => {
-            const response = object(await withAbort(web.debugger.sendCommand('Network.getResponseBody', { requestId: params.requestId }), AbortSignal.any([signal, AbortSignal.timeout(10000)])));
+        const operation = (async () => {
+            let response: Record<string, unknown> = {};
+            let lastError: unknown;
+            for (let attempt = 0; attempt < 4; attempt++) {
+                try {
+                    response = object(await withAbort(web.debugger.sendCommand('Network.getResponseBody', { requestId: params.requestId }), AbortSignal.any([signal, AbortSignal.timeout(10000)])));
+                    lastError = undefined;
+                    break;
+                } catch (error) {
+                    lastError = error;
+                    if (attempt < 3) await delay(250, signal);
+                }
+            }
+            if (lastError) {
+                // A duplicate self-profile refresh can be evicted while the
+                // first successful identity response is already available.
+                if (request.self && selfId) return;
+                throw lastError instanceof Error ? lastError : new Error('收藏响应无法读取');
+            }
             if (signal.aborted) return;
             if (typeof response.body !== 'string' || response.body.length > 4 * 1024 * 1024 || response.base64Encoded) throw new Error('收藏响应无法读取');
             const payload: unknown = JSON.parse(response.body), root = object(payload), data = object(root.data);
@@ -204,42 +319,81 @@ async function readSignedFavorites(platform: Exclude<FavoritePlatform, 'bilibili
                     selfId = id;
                 }
             } else received.push(parseFavoritePage(platform, payload));
-        }).catch((error: unknown) => { failure = error instanceof Error ? error : new Error('收藏读取失败'); });
+        })().catch((error: unknown) => { failure = error instanceof Error ? error : new Error('收藏读取失败'); });
+        processing.add(operation);
+        void operation.finally(() => processing.delete(operation));
     };
-    web.debugger.attach('1.3');
-    web.debugger.on('message', listener);
+    const home = platform === 'xiaohongshu' ? 'https://www.xiaohongshu.com/explore' : 'https://www.douyin.com/';
     try {
-        await withAbort(web.debugger.sendCommand('Network.enable', { maxResourceBufferSize: 4 * 1024 * 1024, maxTotalBufferSize: 8 * 1024 * 1024 }), AbortSignal.any([signal, AbortSignal.timeout(10000)]));
-        await navigate(platform === 'xiaohongshu' ? 'https://www.xiaohongshu.com/explore' : 'https://www.douyin.com/');
-        const selfDeadline = Date.now() + 20000;
-        while (!selfId) {
-            if (failure) throw failure;
-            if (Date.now() > selfDeadline) throw new AuthorizationRequired('无法确认原站账号，请登录并完成访问验证后重试');
-            await delay(300, signal);
-        }
+        // Electron can leave Network.enable pending when the debugger is
+        // attached before the first document exists. Let the owned renderer
+        // finish its initial navigation, then enable the domain and reload
+        // the trusted home page so the self response is still observed.
+        await navigate(home);
+        web.debugger.attach('1.3');
+        web.debugger.on('message', listener);
+        await withAbort(web.debugger.sendCommand('Network.enable', { maxResourceBufferSize: 16 * 1024 * 1024, maxTotalBufferSize: 64 * 1024 * 1024 }), AbortSignal.any([signal, AbortSignal.timeout(10000)]));
+        await withAbort(web.debugger.sendCommand('Runtime.enable'), AbortSignal.any([signal, AbortSignal.timeout(10000)]));
+        await navigate(home);
+        if (platform === 'xiaohongshu') {
+            const selfDeadline = Date.now() + 20000;
+            while (!selfId) {
+                if (failure) throw failure;
+                if (Date.now() > selfDeadline) throw new AuthorizationRequired('无法确认原站账号，请登录并完成访问验证后重试');
+                await delay(300, signal);
+            }
+        } else failure = undefined;
         reading = true;
-        await navigate(platform === 'xiaohongshu' ? `https://www.xiaohongshu.com/user/profile/${selfId}?tab=collect` : 'https://www.douyin.com/user/self?showTab=favorite_collection');
-        let deadline = Date.now() + 30000, tabActivated = false;
+        // Xiaohongshu's profile page uses the `fav` top-level tab and the
+        // `note` sub-tab. `tab=collect` falls back to the published-notes tab
+        // on the current web shell, so no collect-page request is emitted.
+        await navigate(platform === 'xiaohongshu' ? `https://www.xiaohongshu.com/user/profile/${selfId}?tab=fav&subTab=note` : 'https://www.douyin.com/user/self?showTab=favorite_collection');
+        if (platform === 'douyin') await delay(3000, signal);
+        let deadline = Date.now() + (platform === 'douyin' ? 120000 : 30000), tabActivated = false;
         while (!finished) {
             signal.throwIfAborted();
-            if (failure) throw failure;
+            if (failure) {
+                // Douyin may evict the large mix-list response from the CDP
+                // cache even though its authenticated page has rendered the
+                // same works. Let the DOM fallback consume that page.
+                if (platform === 'douyin' && !(failure instanceof AuthorizationRequired)) failure = undefined;
+                else throw failure;
+            }
             if (win.isDestroyed() || !sessions.allowed(platform, web.getURL())) throw new Error('收藏窗口已关闭或离开原站');
+            if (platform === 'douyin' && !received.length) {
+                const activated = await run(advanceFavoritePageScript(!tabActivated));
+                tabActivated ||= activated === true;
+                await delay(700, signal);
+                const rendered = object(await run(readRenderedDouyinPageScript()));
+                const urls = Array.isArray(rendered.urls) ? rendered.urls : [];
+                const items: FavoriteItem[] = urls.flatMap(value => {
+                    const row = object(value), identity = favoriteIdentity(text(row.url), 'douyin');
+                    return identity ? [{ platform: 'douyin', id: identity.id, url: identity.url, title: text(row.title) || identity.id }] : [];
+                });
+                const signature = text(rendered.signature);
+                if (rendered.ready === true && items.length && signature && signature !== renderedSignature) {
+                    renderedSignature = signature;
+                    received.push({ items, skipped: urls.length - items.length, hasMore: false, cursor: `dom-${signature}` });
+                } else if (rendered.ready === true && !items.length && !received.length) finished = true;
+            }
             for (const page of received.splice(0)) {
                 if (page.hasMore && cursors.has(page.cursor)) throw new Error('收藏分页未推进，未宣称全量读取完成；请刷新后重试');
                 cursors.add(page.cursor); pages++;
-                await onPage({ page, label: `第 ${pages} 页` }); deadline = Date.now() + 30000;
+                await onPage({ page, label: `第 ${pages} 页` }); deadline = Date.now() + (platform === 'douyin' ? 120000 : 30000);
                 if (!page.hasMore) { finished = true; break; }
             }
             if (!finished) {
                 if (Date.now() > deadline) throw new Error('收藏加载超时，已保留读取到的条目；请在原站完成验证后重新读取');
-                const activated = await run(`(${advanceFavoritePage.toString()})(${!tabActivated})`);
-                tabActivated ||= activated === true;
-                await delay(600, signal);
+                if (platform !== 'douyin') {
+                    const activated = await run(advanceFavoritePageScript(!tabActivated));
+                    tabActivated ||= activated === true;
+                    await delay(600, signal);
+                }
             }
         }
     } finally {
         web.debugger.removeListener('message', listener);
-        await processing;
+        await Promise.all([...processing]);
         if (!win.isDestroyed()) try { web.debugger.detach(); } catch { /* Closed owned renderer. */ }
     }
 }
