@@ -1,7 +1,7 @@
 import { zsxqRead, type ZsxqReadOptions } from './adapters/zsxq-browser';
 import { withAbort } from "./async";
 import type { RenderedSnapshot } from "./adapters/rendered-sites";
-import { SiteSessions, AuthorizationRequired } from "./auth";
+import { SiteSessions, AuthorizationRequired, type SiteWindow } from "./auth";
 import { platformFor, taobaoItemId } from "./config";
 import { taobaoLoadStep } from './taobao-page';
 import type { CommentBatch } from "./comments";
@@ -441,6 +441,35 @@ async function pause(ms: number, signal: AbortSignal): Promise<void> {
     signal.addEventListener("abort", stop, { once: true });
   });
 }
+/**
+ * A restored authenticated renderer can reload immediately after dom-ready.
+ * Electron rejects an evaluation while that navigation replaces the document.
+ * Retry only those transient context failures so a real page exception still
+ * reaches the caller with its original error.
+ */
+async function executePageScript<T>(
+  web: SiteWindow['webContents'],
+  script: string,
+  signal: AbortSignal,
+): Promise<T> {
+  let failure: unknown;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      return await withAbort(
+        web.executeJavaScript(script, false) as Promise<T>,
+        signal,
+      );
+    } catch (error) {
+      if (signal.aborted) throw error;
+      failure = error;
+      const message = error instanceof Error ? error.message : String(error);
+      if (attempt >= 3 || !/Script failed to execute|(?:frame|context).*(?:destroy|navigat)/i.test(message))
+        throw error;
+      await pause(350, signal);
+    }
+  }
+  throw failure instanceof Error ? failure : new Error('页面脚本执行失败');
+}
 export async function sourcePage(
   sessions: SiteSessions,
   url: string,
@@ -780,11 +809,15 @@ export async function sourcePage(
     if(platform==='zsxq' && !zsxqArticleId(url)) {
       for(let attempt=0;attempt<12 && !zsxqTopics.length && !captureError;attempt++)await pause(500,signal);
     }
-    let snapshot = await withAbort(
-      win.webContents.executeJavaScript(
-        `(${snapshotPage.toString()})(${platform === 'web' || platform === 'zsxq' || platform === 'taobao'})`,
-        false,
-      ) as Promise<RenderedSnapshot>,
+    // Restoring Douyin/XHS localStorage triggers one reload from the
+    // SiteSessions dom-ready handler. Give that reload a chance to settle
+    // before taking the first snapshot, then retry any remaining context race.
+    if ((platform === 'douyin' || platform === 'xiaohongshu') &&
+        sessions.hasLocalStorageAuthorization?.(platform) === true)
+      await pause(1000, signal);
+    let snapshot = await executePageScript<RenderedSnapshot>(
+      win.webContents,
+      `(${snapshotPage.toString()})(${platform === 'web' || platform === 'zsxq' || platform === 'taobao'})`,
       signal,
     );
     if (platform === 'web' || platform === 'zsxq' || platform === 'taobao') snapshot.httpStatus = httpStatus;
@@ -859,11 +892,9 @@ export async function sourcePage(
       : undefined;
     if (xhsWorkId) {
       const parsed = new URL(url);
-      xhsDetail = await withAbort(
-        win.webContents.executeJavaScript(
-          `(${requestXhsDetail.toString()})(${JSON.stringify(xhsWorkId)},${JSON.stringify(parsed.searchParams.get("xsec_token") || "")})`,
-          false,
-        ) as Promise<Record<string, unknown> | undefined>,
+      xhsDetail = await executePageScript<Record<string, unknown> | undefined>(
+        win.webContents,
+        `(${requestXhsDetail.toString()})(${JSON.stringify(xhsWorkId)},${JSON.stringify(parsed.searchParams.get("xsec_token") || "")})`,
         signal,
       );
       if (xhsDetail) {
@@ -883,11 +914,9 @@ export async function sourcePage(
         await withAbort(win.loadURL("https://www.douyin.com/"), signal);
         await pause(1000, signal);
       }
-      douyinDetail = await withAbort(
-        win.webContents.executeJavaScript(
-          `(${requestDouyinDetail.toString()})(${JSON.stringify(workId)})`,
-          false,
-        ) as Promise<Record<string, unknown> | undefined>,
+      douyinDetail = await executePageScript<Record<string, unknown> | undefined>(
+        win.webContents,
+        `(${requestDouyinDetail.toString()})(${JSON.stringify(workId)})`,
         signal,
       );
       if (douyinDetail) {

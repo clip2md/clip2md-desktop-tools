@@ -156,3 +156,39 @@ describe('Taobao local page loading',()=>{
     }finally{vi.useRealTimers();}
   });
 });
+
+it('retries the first Douyin snapshot when restored localStorage reloads the renderer', async () => {
+  vi.useFakeTimers();
+  const url = 'https://www.douyin.com/video/1234567890123456789';
+  const snapshot = { url, html: '<main>视频</main>', videos: [] };
+  const executeJavaScript = vi.fn()
+    .mockRejectedValueOnce(new Error('Script failed to execute, this normally means an error was thrown.'))
+    .mockResolvedValue(snapshot);
+  const web = Object.assign(new EventEmitter(), {
+    getURL: () => url,
+    executeJavaScript,
+    debugger: {
+      attach: vi.fn(),
+      detach: vi.fn(),
+      on: vi.fn(),
+      removeListener: vi.fn(),
+      sendCommand: vi.fn(async () => ({})),
+    },
+  });
+  const win = { webContents: web, loadURL: vi.fn(async () => {}), isDestroyed: () => false, destroy: vi.fn() };
+  const sessions = {
+    targetFor: () => 'douyin',
+    open: vi.fn(async () => win),
+    allowed: () => true,
+    release: vi.fn(),
+  };
+  try {
+    const pending = sourcePage(sessions as unknown as SiteSessions, url, new AbortController().signal);
+    await vi.runAllTimersAsync();
+    await expect(pending).resolves.toMatchObject({ url });
+    expect(executeJavaScript.mock.calls.filter(([script]) => String(script).includes('function snapshotPage')).length).toBe(2);
+    expect(sessions.release).toHaveBeenCalled();
+  } finally {
+    vi.useRealTimers();
+  }
+});

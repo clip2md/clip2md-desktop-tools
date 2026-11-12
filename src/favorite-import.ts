@@ -13,6 +13,9 @@ export interface FavoriteItem {
 }
 export interface FavoritePage { items: FavoriteItem[]; skipped: number; hasMore: boolean; cursor: string; }
 export interface FavoriteProgress { page: FavoritePage; label: string; }
+export function isDouyinChallengeText(value: string): boolean {
+    return /验证码中间页|安全验证|访问验证|请完成验证|滑块验证|访问环境异常|captcha/i.test(value);
+}
 const object = (value: unknown): Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const text = (value: unknown): string => typeof value === 'string' ? value.replace(/\s+/g, ' ').trim().slice(0, 240) : '';
 function address(value: unknown): string | undefined {
@@ -152,6 +155,10 @@ function readRenderedDouyinPageScript(): string {
         let stableBottom = 0, previousSignature = '', previousMetrics = '';
         let sawContainer = false;
         for (let attempt = 0; attempt < 80; attempt++) {
+          const pageText = (document.title + ' ' + (document.body?.innerText || '')).slice(0, 12000);
+          const challenge = /验证码中间页|安全验证|访问验证|请完成验证|滑块验证|访问环境异常|captcha/i.test(pageText)
+            || Array.from(document.querySelectorAll('iframe')).some(frame => /verify|captcha/i.test(frame.src) && visible(frame));
+          if (challenge) return { urls: [], ready: false, challenge: true, surface: false, signature: '' };
           collect();
           const containers = [document.scrollingElement, ...Array.from(document.querySelectorAll('[data-e2e="scroll-list"],main,[class*="scroll"],[class*="content"],[class*="container"]'))]
             .filter(visible);
@@ -175,7 +182,9 @@ function readRenderedDouyinPageScript(): string {
         collect();
         const urls = [...all.values()];
         const signature = urls.map(value => value.url).join('|');
-        return { urls, ready: stableBottom >= 8, signature };
+        const surface = !!document.querySelector('[data-e2e="scroll-list"]')
+          || Array.from(document.querySelectorAll('button,[role="tab"],a,span')).some(el => el.textContent?.trim() === '收藏');
+        return { urls, ready: stableBottom >= 8, challenge: false, surface, signature };
       }
     )()`;
 }
@@ -201,18 +210,18 @@ interface FavoriteWebContents {
         sendCommand(method: string, params?: Record<string, unknown>): Promise<unknown>;
     };
 }
-export async function loadFavoriteItems(platform: FavoritePlatform, sessions: SiteSessions, signal: AbortSignal, onPage: (progress: FavoriteProgress) => Promise<void>): Promise<void> {
+export async function loadFavoriteItems(platform: FavoritePlatform, sessions: SiteSessions, signal: AbortSignal, onPage: (progress: FavoriteProgress) => Promise<void>, onStatus?: (message: string) => void): Promise<void> {
     signal.throwIfAborted();
     const win = await sessions.open(platform, false), web = win.webContents as FavoriteWebContents;
     const stop = () => sessions.release(win);
     signal.addEventListener('abort', stop, { once: true });
-    const run = async (script: string) => {
+    const run = async (script: string, timeoutMs = 20000) => {
         signal.throwIfAborted();
         if (!sessions.allowed(platform, web.getURL())) throw new Error('收藏页面已离开原站，读取已停止');
         if (platform !== 'bilibili') {
             const evaluated = object(await withAbort(web.debugger.sendCommand('Runtime.evaluate', {
                 expression: script, awaitPromise: true, returnByValue: true,
-            }), AbortSignal.any([signal, AbortSignal.timeout(20000)])));
+            }), AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])));
             if (Object.prototype.hasOwnProperty.call(evaluated, 'result')) {
                 const exception = object(evaluated.exceptionDetails);
                 if (Object.keys(exception).length) throw new Error(text(object(exception.exception).description) || '原站页面脚本执行失败');
@@ -221,7 +230,7 @@ export async function loadFavoriteItems(platform: FavoritePlatform, sessions: Si
         }
         for (let attempt = 0; ; attempt++) {
             try {
-                return await withAbort(web.executeJavaScript(script, false), AbortSignal.any([signal, AbortSignal.timeout(20000)]));
+                return await withAbort(web.executeJavaScript(script, false), AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]));
             } catch (error) {
                 const failure = error instanceof Error ? error : new Error('收藏页面脚本执行失败');
                 if (signal.aborted || attempt >= 3 || !/Script failed to execute|(?:frame|context).*(?:destroy|navigat)|收藏页面脚本执行失败/i.test(failure.message)) throw failure;
@@ -256,15 +265,15 @@ export async function loadFavoriteItems(platform: FavoritePlatform, sessions: Si
                     await delay(300, signal);
                 }
             }
-        } else await readSignedFavorites(platform, sessions, win, run, navigate, signal, onPage);
+        } else await readSignedFavorites(platform, sessions, win, run, navigate, signal, onPage, onStatus);
     } finally {
         signal.removeEventListener('abort', stop);
         sessions.release(win);
     }
 }
 async function readSignedFavorites(platform: Exclude<FavoritePlatform, 'bilibili'>, sessions: SiteSessions, win: SiteWindow,
-    run: (script: string) => Promise<unknown>, navigate: (url: string) => Promise<void>, signal: AbortSignal,
-    onPage: (progress: FavoriteProgress) => Promise<void>): Promise<void> {
+    run: (script: string, timeoutMs?: number) => Promise<unknown>, navigate: (url: string) => Promise<void>, signal: AbortSignal,
+    onPage: (progress: FavoriteProgress) => Promise<void>, onStatus?: (message: string) => void): Promise<void> {
     const web = win.webContents as FavoriteWebContents;
     let selfId = '', failure: Error | undefined, reading = false, finished = false, pages = 0, renderedSignature = '';
     const pending = new Map<string, { self: boolean; url: string }>(), received: FavoritePage[] = [], cursors = new Set<string>();
@@ -364,7 +373,30 @@ async function readSignedFavorites(platform: Exclude<FavoritePlatform, 'bilibili
                 const activated = await run(advanceFavoritePageScript(!tabActivated));
                 tabActivated ||= activated === true;
                 await delay(700, signal);
-                const rendered = object(await run(readRenderedDouyinPageScript()));
+                const rendered = object(await run(readRenderedDouyinPageScript(), 60000));
+                if (rendered.challenge === true) {
+                    win.show?.(); win.focus?.();
+                    onStatus?.('抖音安全验证中，请在弹出的抖音窗口完成验证；验证完成后会自动继续读取收藏。');
+                    const challengeDeadline = Date.now() + 180000;
+                    let cleared = false;
+                    while (Date.now() < challengeDeadline) {
+                        signal.throwIfAborted();
+                        await delay(1000, signal);
+                        const state = object(await run(`(() => {
+                            const text = (document.title + ' ' + (document.body?.innerText || '')).slice(0, 12000);
+                            const visible = el => el instanceof HTMLElement && el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0;
+                            return { challenge: /验证码中间页|安全验证|访问验证|请完成验证|滑块验证|访问环境异常|captcha/i.test(text)
+                                || Array.from(document.querySelectorAll('iframe')).some(frame => /verify|captcha/i.test(frame.src) && visible(frame)) };
+                        })()`));
+                        if (state.challenge !== true) { cleared = true; break; }
+                    }
+                    if (!cleared) throw new AuthorizationRequired('抖音安全验证未完成，请在弹出的抖音窗口完成验证后重新读取收藏');
+                    await navigate('https://www.douyin.com/user/self?showTab=favorite_collection');
+                    await delay(3000, signal);
+                    renderedSignature = ''; received.splice(0); failure = undefined; deadline = Date.now() + 120000;
+                    onStatus?.('抖音验证已完成，正在重新读取收藏列表…');
+                    continue;
+                }
                 const urls = Array.isArray(rendered.urls) ? rendered.urls : [];
                 const items: FavoriteItem[] = urls.flatMap(value => {
                     const row = object(value), identity = favoriteIdentity(text(row.url), 'douyin');
@@ -374,7 +406,10 @@ async function readSignedFavorites(platform: Exclude<FavoritePlatform, 'bilibili
                 if (rendered.ready === true && items.length && signature && signature !== renderedSignature) {
                     renderedSignature = signature;
                     received.push({ items, skipped: urls.length - items.length, hasMore: false, cursor: `dom-${signature}` });
-                } else if (rendered.ready === true && !items.length && !received.length) finished = true;
+                } else if (rendered.ready === true && !items.length && !received.length) {
+                    if (rendered.surface !== true) throw new Error('抖音收藏页未加载成功，请完成安全验证后重新读取收藏');
+                    finished = true;
+                }
             }
             for (const page of received.splice(0)) {
                 if (page.hasMore && cursors.has(page.cursor)) throw new Error('收藏分页未推进，未宣称全量读取完成；请刷新后重试');

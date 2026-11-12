@@ -10,6 +10,7 @@ export interface FavoriteImportOptions {
     available(platform: FavoritePlatform): boolean;
     authorize(platform: FavoritePlatform, signal: AbortSignal): Promise<void>;
     submit(request: FavoriteImportRequest): Promise<FavoriteImportResponse>;
+    log?: (event: string, fields?: Record<string, unknown>, error?: unknown) => void;
 }
 const labels: Record<FavoriteImportStatus, string> = {
     created: '已创建', duplicate: '已有任务', quota_skipped: '额度不足，未导入', invalid: '无法识别', failed: '提交失败，可继续',
@@ -162,6 +163,7 @@ export class FavoriteImportModal extends Modal {
         if (this.busy || !this.options.available(this.platform)) return;
         this.busy = true; this.controller = new AbortController(); this.updateControls();
         const platform = this.platform, signal = this.controller.signal, store = this.store!;
+        this.options.log?.('favorite.read.started', { platform });
         try {
             await this.options.authorize(platform, signal);
             const fingerprint = await this.options.sessions.authorizationFingerprint(platform);
@@ -171,10 +173,17 @@ export class FavoriteImportModal extends Modal {
             await loadFavoriteItems(platform, this.options.sessions, signal, async (progress: FavoriteProgress) => {
                 mergeFavoritePage(draft, progress); await store.checkpointPage(draft);
                 if (this.alive) { this.status.setText(`正在读取 ${progress.label}`); this.render(); }
+            }, message => {
+                this.options.log?.('favorite.read.status', { platform, message });
+                if (this.alive) this.status.setText(message);
             });
             signal.throwIfAborted(); draft.complete = true; await store.save(draft);
+            this.options.log?.('favorite.read.finished', { platform, count: draft.entries.length, skipped: draft.skipped, duplicates: draft.duplicates });
             if (this.alive) this.status.setText(draft.entries.length ? '全部收藏读取完成，可检查额度并导入。' : '收藏列表为空，或没有支持的单条作品。');
-        } catch (error) { if (this.alive) this.status.setText(signal.aborted ? '读取已暂停，条目保留；请重新读取完整列表后导入。' : error instanceof Error ? error.message : '读取失败，请重新登录后重试'); }
+        } catch (error) {
+            this.options.log?.('favorite.read.failed', { platform, count: this.draft?.entries.length || 0, complete: this.draft?.complete === true }, error);
+            if (this.alive) this.status.setText(signal.aborted ? '读取已暂停，条目保留；请重新读取完整列表后导入。' : error instanceof Error ? error.message : '读取失败，请重新登录后重试');
+        }
         finally { this.busy = false; if (this.alive) this.render(); }
     }
     private async submit(): Promise<void> {

@@ -630,7 +630,11 @@ export default class DesktopTools extends Plugin {
         // request authorization only if the rendered page is actually a
         // login or access-challenge page.
         if(platform.startsWith('web:'))return;
+        const localStorageAuthorized = typeof (this.sessions as unknown as { hasLocalStorageAuthorization?: unknown }).hasLocalStorageAuthorization === "function" &&
+            this.sessions.hasLocalStorageAuthorization(platform);
         const checked = await (async()=>{
+            if (platform === 'douyin' && localStorageAuthorized)
+                return { state: 'authenticated', nickname: '抖音账号', sessionOnly: true } as const;
             if(platform==='youtube'||platform==='twitter')return readAccountProfile(this.sessions,platform,AbortSignal.any([signal,AbortSignal.timeout(platform==='youtube'?60000:15000)]));
             return await this.sessions.cookieLoginProfile(platform) || await readAccountProfile(this.sessions,platform,AbortSignal.any([signal,AbortSignal.timeout(15000)]));
         })();
@@ -1474,6 +1478,7 @@ export default class DesktopTools extends Plugin {
                 && this.settings.platformEnabled[platform] && !this.updatePaused && !bridge.updatePaused?.(),
             authorize: (platform, signal) => this.requirePlatformLogin(`https://www.${platform === 'bilibili' ? 'bilibili.com' : platform === 'douyin' ? 'douyin.com' : 'xiaohongshu.com'}/`, signal),
             submit: request => bridge.submitFavoriteLinks!(request),
+            log: (event, fields, error) => this.logger?.log(event, fields || {}, error ? 'error' : 'info', undefined, error),
         }, platform);
         this.favoriteModal.open();
     }
