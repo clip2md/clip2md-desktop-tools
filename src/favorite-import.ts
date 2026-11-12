@@ -276,8 +276,61 @@ async function readSignedFavorites(platform: Exclude<FavoritePlatform, 'bilibili
     onPage: (progress: FavoriteProgress) => Promise<void>, onStatus?: (message: string) => void): Promise<void> {
     const web = win.webContents as FavoriteWebContents;
     let selfId = '', failure: Error | undefined, reading = false, finished = false, pages = 0, renderedSignature = '';
-    const pending = new Map<string, { self: boolean; url: string }>(), received: FavoritePage[] = [], cursors = new Set<string>();
+    type PendingResponse = {
+        self: boolean;
+        url: string;
+        finished: boolean;
+        captured: boolean;
+        reading?: Promise<void>;
+    };
+    const pending = new Map<string, PendingResponse>(), received: FavoritePage[] = [], cursors = new Set<string>();
     const processing = new Set<Promise<void>>();
+    const reportFailure = (request: PendingResponse, error: unknown): void => {
+        // A duplicate self-profile refresh can be evicted while the first
+        // successful identity response is already available.
+        if (request.self && selfId) return;
+        failure = error instanceof Error ? error : new Error('收藏读取失败');
+    };
+    const capture = (requestId: string, request: PendingResponse): void => {
+        if (request.captured || request.reading) return;
+        const operation = (async () => {
+            let response: Record<string, unknown> = {};
+            let lastError: unknown;
+            // Start at responseReceived and keep trying through loadingFinished.
+            // This avoids losing a body when the renderer evicts the request
+            // shortly after the response has completed.
+            for (let attempt = 0; attempt < 8; attempt++) {
+                try {
+                    response = object(await withAbort(web.debugger.sendCommand('Network.getResponseBody', { requestId }), AbortSignal.any([signal, AbortSignal.timeout(10000)])));
+                    if (typeof response.body !== 'string' || response.body.length > 4 * 1024 * 1024 || response.base64Encoded)
+                        throw new Error('收藏响应无法读取');
+                    const payload: unknown = JSON.parse(response.body), root = object(payload), data = object(root.data);
+                    if (request.self) {
+                        const id = platform === 'xiaohongshu' && root.code === 0 && root.success === true && data.guest !== true ? data.user_id ?? data.userId
+                            : platform === 'douyin' && root.status_code === 0 ? object(root.user).uid : undefined;
+                        if (typeof id === 'string' && /^[a-zA-Z0-9_-]+$/.test(id)) {
+                            if (selfId && selfId !== id) throw new AuthorizationRequired('原站账号已变化，请重新读取收藏');
+                            selfId = id;
+                        }
+                    } else received.push(parseFavoritePage(platform, payload));
+                    request.captured = true;
+                    return;
+                } catch (error) {
+                    lastError = error;
+                    if (signal.aborted) return;
+                    if (attempt < 7) await delay(Math.min(250, 50 * (attempt + 1)), signal);
+                }
+            }
+            if (request.finished) reportFailure(request, lastError);
+        })();
+        request.reading = operation;
+        processing.add(operation);
+        void operation.finally(() => {
+            processing.delete(operation);
+            request.reading = undefined;
+            if (request.finished && (request.captured || failure)) pending.delete(requestId);
+        });
+    };
     const listener = (_event: unknown, method: string, params: { requestId: string; response?: { url: string; status: number } }) => {
         if (signal.aborted) return;
         if (method === 'Network.responseReceived' && params.response) {
@@ -294,43 +347,14 @@ async function readSignedFavorites(platform: Exclude<FavoritePlatform, 'bilibili
                 if (favorite && !failure) failure = new Error('原站收藏列表访问受限，请完成验证后重试');
                 return;
             }
-            pending.set(params.requestId, { self, url: url.href });
+            const request: PendingResponse = { self, url: url.href, finished: false, captured: false };
+            pending.set(params.requestId, request);
+            capture(params.requestId, request);
         }
         if (method !== 'Network.loadingFinished') return;
-        const request = pending.get(params.requestId); if (!request) return; pending.delete(params.requestId);
-        const operation = (async () => {
-            let response: Record<string, unknown> = {};
-            let lastError: unknown;
-            for (let attempt = 0; attempt < 4; attempt++) {
-                try {
-                    response = object(await withAbort(web.debugger.sendCommand('Network.getResponseBody', { requestId: params.requestId }), AbortSignal.any([signal, AbortSignal.timeout(10000)])));
-                    lastError = undefined;
-                    break;
-                } catch (error) {
-                    lastError = error;
-                    if (attempt < 3) await delay(250, signal);
-                }
-            }
-            if (lastError) {
-                // A duplicate self-profile refresh can be evicted while the
-                // first successful identity response is already available.
-                if (request.self && selfId) return;
-                throw lastError instanceof Error ? lastError : new Error('收藏响应无法读取');
-            }
-            if (signal.aborted) return;
-            if (typeof response.body !== 'string' || response.body.length > 4 * 1024 * 1024 || response.base64Encoded) throw new Error('收藏响应无法读取');
-            const payload: unknown = JSON.parse(response.body), root = object(payload), data = object(root.data);
-            if (request.self) {
-                const id = platform === 'xiaohongshu' && root.code === 0 && root.success === true && data.guest !== true ? data.user_id ?? data.userId
-                    : platform === 'douyin' && root.status_code === 0 ? object(root.user).uid : undefined;
-                if (typeof id === 'string' && /^[a-zA-Z0-9_-]+$/.test(id)) {
-                    if (selfId && selfId !== id) throw new AuthorizationRequired('原站账号已变化，请重新读取收藏');
-                    selfId = id;
-                }
-            } else received.push(parseFavoritePage(platform, payload));
-        })().catch((error: unknown) => { failure = error instanceof Error ? error : new Error('收藏读取失败'); });
-        processing.add(operation);
-        void operation.finally(() => processing.delete(operation));
+        const request = pending.get(params.requestId); if (!request) return;
+        request.finished = true;
+        capture(params.requestId, request);
     };
     const home = platform === 'xiaohongshu' ? 'https://www.xiaohongshu.com/explore' : 'https://www.douyin.com/';
     try {
@@ -366,7 +390,7 @@ async function readSignedFavorites(platform: Exclude<FavoritePlatform, 'bilibili
                 // cache even though its authenticated page has rendered the
                 // same works. Let the DOM fallback consume that page.
                 if (platform === 'douyin' && !(failure instanceof AuthorizationRequired)) failure = undefined;
-                else throw failure;
+                else if (!received.length) throw failure;
             }
             if (win.isDestroyed() || !sessions.allowed(platform, web.getURL())) throw new Error('收藏窗口已关闭或离开原站');
             if (platform === 'douyin' && !received.length) {
@@ -417,6 +441,7 @@ async function readSignedFavorites(platform: Exclude<FavoritePlatform, 'bilibili
                 await onPage({ page, label: `第 ${pages} 页` }); deadline = Date.now() + (platform === 'douyin' ? 120000 : 30000);
                 if (!page.hasMore) { finished = true; break; }
             }
+            if (failure) throw failure;
             if (!finished) {
                 if (Date.now() > deadline) throw new Error('收藏加载超时，已保留读取到的条目；请在原站完成验证后重新读取');
                 if (platform !== 'douyin') {

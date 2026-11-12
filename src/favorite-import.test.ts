@@ -1,9 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
-import { favoriteEndpoint, loadFavoriteItems, parseFavoritePage, type FavoriteProgress } from './favorite-import';
+import { favoriteEndpoint, isDouyinChallengeText, loadFavoriteItems, parseFavoritePage, type FavoriteProgress } from './favorite-import';
 import type { SiteSessions } from './auth';
 const BV = 'BV1xx411c7mD', NOTE = '0123456789abcdef01234567';
 const bili = (id = 1) => ({ id, bvid: BV, type: 2, title: '标题', attr: 0, upper: { name: '作者' }, fav_time: 1720000000 });
 describe('favorites response fixtures', () => {
+    it('recognizes Douyin challenge pages separately from authenticated state', () => {
+        expect(isDouyinChallengeText('验证码中间页')).toBe(true);
+        expect(isDouyinChallengeText('请完成验证后继续访问')).toBe(true);
+        expect(isDouyinChallengeText('收藏')).toBe(false);
+    });
     it('parses Bilibili works and filters deleted media, profiles and non-video collections', () => {
         const page = parseFavoritePage('bilibili', { code: 0, data: { has_more: false, medias: [bili(), { ...bili(2), attr: 1 }, { ...bili(3), type: 21 }, { type: 'user', id: 4 }] } });
         expect(page.items).toHaveLength(1); expect(page.skipped).toBe(3); expect(page.items[0]).toMatchObject({ url: `https://www.bilibili.com/video/${BV}`, author: '作者', collectedAt: expect.any(String) });
@@ -85,9 +90,10 @@ describe('Bilibili authenticated pagination', () => {
 });
 
 describe('signed favorites renderer', () => {
-    function fixture(platform: 'xiaohongshu' | 'douyin', fail = false, includeUserId = true, scriptFailures = 0) {
+    function fixture(platform: 'xiaohongshu' | 'douyin', fail = false, includeUserId = true, scriptFailures = 0, bodyFailures = 0, domFallback = false) {
         let listener: ((event: unknown, method: string, params: unknown) => void) | undefined;
         let current = '', sequence = 0, advance = 0;
+        let remainingBodyFailures = bodyFailures;
         const bodies = new Map<string, unknown>();
         const emit = (url: string, payload: unknown, status = 200) => {
             const id = String(++sequence); bodies.set(id, payload);
@@ -100,7 +106,19 @@ describe('signed favorites renderer', () => {
         const endpoint = platform === 'xiaohongshu'
             ? `https://edith.xiaohongshu.com/api/sns/web/v2/note/collect/page?${includeUserId ? `userId=${NOTE}&` : ''}num=30&cursor=`
             : 'https://www.douyin.com/aweme/v1/web/aweme/listcollection/';
-        const debug = { attach: vi.fn(), detach: vi.fn(), on: vi.fn((_name, fn) => { listener = fn; }), removeListener: vi.fn(), sendCommand: vi.fn(async (command, params) => command === 'Network.getResponseBody' ? { body: JSON.stringify(bodies.get(params.requestId)), base64Encoded: false } : {}) };
+        const debug = { attach: vi.fn(), detach: vi.fn(), on: vi.fn((_name, fn) => { listener = fn; }), removeListener: vi.fn(), sendCommand: vi.fn(async (command, params) => {
+            if (command === 'Network.getResponseBody' && remainingBodyFailures > 0) {
+                remainingBodyFailures--;
+                throw new Error('No resource with given identifier found');
+            }
+            if (command === 'Runtime.evaluate' && domFallback) {
+                const expression = String(params?.expression || '');
+                return expression.includes('stableBottom')
+                    ? { result: { value: { urls: [{ url: 'https://www.douyin.com/video/124', title: 'DOM 收藏视频' }], ready: true, challenge: false, surface: true, signature: 'dom-fallback' } } }
+                    : { result: { value: true } };
+            }
+            return command === 'Network.getResponseBody' ? { body: JSON.stringify(bodies.get(params.requestId)), base64Encoded: false } : {};
+        }) };
         const window = { isDestroyed: () => false, loadURL: vi.fn(async (url: string) => {
             current = url;
             if (url.endsWith('/explore') || url === 'https://www.douyin.com/') {
@@ -136,6 +154,16 @@ describe('signed favorites renderer', () => {
         const f = fixture('xiaohongshu', false, true, 1), pages: FavoriteProgress[] = [];
         await loadFavoriteItems('xiaohongshu', f.sessions, new AbortController().signal, async page => { pages.push(page); });
         expect(pages).toHaveLength(2);
+    });
+    it('captures a response when CDP briefly loses its request body', async () => {
+        const f = fixture('xiaohongshu', false, true, 0, 5), pages: FavoriteProgress[] = [];
+        await loadFavoriteItems('xiaohongshu', f.sessions, new AbortController().signal, async page => { pages.push(page); });
+        expect(pages).toHaveLength(2);
+    });
+    it('uses the Douyin DOM fallback when the collection response body is unavailable', async () => {
+        const f = fixture('douyin', false, true, 0, 100, true), pages: FavoriteProgress[] = [];
+        await loadFavoriteItems('douyin', f.sessions, new AbortController().signal, async page => { pages.push(page); });
+        expect(pages.flatMap(page => page.page.items).map(item => item.url)).toEqual(['https://www.douyin.com/video/124']);
     });
     it('fails explicitly on expired login and releases the owned window', async () => {
         const f = fixture('xiaohongshu', true);

@@ -25,7 +25,7 @@ beforeAll(() => {
 const modals: FavoriteImportModal[] = [];
 beforeEach(() => { document.body.replaceChildren(); mocks.load.mockReset(); Object.defineProperty(globalThis, 'crypto', { value: webcrypto, configurable: true }); });
 afterEach(() => { for (const modal of modals.splice(0)) modal.onClose(); });
-function fixture(count = 250, available = true) {
+function fixture(count = 250, available = true, readError = false) {
     const files = new Map<string, string>(), folders = new Set<string>(), local = new Map<string, unknown>();
     const app = { loadLocalStorage: (key: string) => local.get(key), saveLocalStorage: (key: string, value: unknown) => { local.set(key, value); }, vault: { configDir: '.obsidian', adapter: {
         exists: async (path: string) => files.has(path) || folders.has(path), read: async (path: string) => files.get(path)!, write: async (path: string, text: string) => { files.set(path, text); }, mkdir: async (path: string) => { folders.add(path); },
@@ -37,7 +37,10 @@ function fixture(count = 250, available = true) {
             for (const [i, entry] of request.entries.entries()) await request.onResult({ url: entry.url, status: i === 0 ? 'created' : 'quota_skipped', ...(i === 0 ? { taskId: 42 } : {}) });
             return { dailyQuota: 1, permanentQuota: 0, syncTriggered: true };
         }) };
-    mocks.load.mockImplementation(async (platform, _sessions, _signal, onPage) => { await onPage({ label: 'page 1', page: { items: Array.from({ length: count }, (_, i) => ({ platform, id: String(i + 1), url: `https://www.douyin.com/video/${i + 1}`, title: `收藏 ${i + 1}` })), hasMore: false, skipped: 0, cursor: '' } }); });
+    mocks.load.mockImplementation(async (platform, _sessions, _signal, onPage) => {
+        await onPage({ label: 'page 1', page: { items: Array.from({ length: count }, (_, i) => ({ platform, id: String(i + 1), url: `https://www.douyin.com/video/${i + 1}`, title: `收藏 ${i + 1}` })), hasMore: false, skipped: 0, cursor: '' } });
+        if (readError) throw new Error('No resource with given identifier found');
+    });
     const open = () => { const modal = new FavoriteImportModal(app, options, 'douyin'); modals.push(modal); modal.onOpen(); return modal; };
     return { app, options, files, open, modal: open() };
 }
@@ -68,6 +71,18 @@ describe('favorites import modal', () => {
     it('requires the platform to be enabled and authorized before reading', async () => {
         const f = fixture(3, false); await vi.waitFor(() => expect(f.modal.contentEl.textContent).toContain('点击读取收藏'));
         expect(button(f.modal, '重新读取全部收藏').disabled).toBe(true); expect(mocks.load).not.toHaveBeenCalled();
+    });
+    it('allows importing entries retained after a partial read failure', async () => {
+        const f = fixture(3, true, true);
+        await vi.waitFor(() => expect(button(f.modal, '重新读取全部收藏').disabled).toBe(false));
+        button(f.modal, '重新读取全部收藏').click();
+        await vi.waitFor(() => expect(f.modal.contentEl.textContent).toContain('收藏读取未完成，已保留 3 条'));
+        const submit = button(f.modal, '检查额度并导入已读取项');
+        expect(submit.disabled).toBe(false);
+        submit.click();
+        await vi.waitFor(() => expect(vi.mocked(f.options.submit)).toHaveBeenCalledOnce());
+        expect(vi.mocked(f.options.submit).mock.calls[0][0].entries).toHaveLength(3);
+        await vi.waitFor(() => expect(f.modal.contentEl.textContent).toContain('已导入已读取条目，收藏列表仍未读取完'));
     });
     it('cancels future submissions when closed, while allowing the accepted in-flight result to be saved', async () => {
         const f = fixture(3); await read(f.modal);

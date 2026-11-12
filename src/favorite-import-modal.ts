@@ -85,7 +85,11 @@ export class FavoriteImportModal extends Modal {
             const draft = await this.store.load();
             if (!this.alive || platform !== this.platform) return;
             this.draft = draft || undefined;
-            this.status.setText(draft ? draft.complete ? '已恢复上次导入记录，可继续未导入项。' : '上次收藏读取未完成，请重新读取全部收藏后导入。' : '点击读取收藏。需先在平台设置中开启并完成原站登录。');
+            this.status.setText(draft
+                ? draft.complete
+                    ? '已恢复上次导入记录，可继续未导入项。'
+                    : '上次收藏读取未完成，可导入已读取条目，或重新读取全部收藏。'
+                : '点击读取收藏。需先在平台设置中开启并完成原站登录。');
         } catch { if (this.alive) this.status.setText('收藏记录损坏，原文件已保留，请重新读取收藏。'); }
         finally { this.busy = false; if (this.alive) this.render(); }
     }
@@ -94,7 +98,8 @@ export class FavoriteImportModal extends Modal {
         this.select.disabled = this.busy;
         this.readButton.disabled = this.busy || !available;
         this.allButton.disabled = this.noneButton.disabled = this.busy || !entries.length;
-        this.submitButton.disabled = this.resumeButton.disabled = this.busy || !available || !this.draft?.complete || !this.pendingCount && !this.hasPendingSync;
+        this.submitButton.disabled = this.resumeButton.disabled = this.busy || !available || !this.pendingCount && !this.hasPendingSync;
+        this.submitButton.setText(this.draft?.complete ? '检查额度并导入全部选中项' : '检查额度并导入已读取项');
         const resuming = Object.values(this.counts).some(count => !!count);
         this.submitButton.hidden = resuming; this.resumeButton.hidden = !resuming;
         this.cancelButton.setText(this.busy ? '暂停导入' : '关闭');
@@ -182,12 +187,19 @@ export class FavoriteImportModal extends Modal {
             if (this.alive) this.status.setText(draft.entries.length ? '全部收藏读取完成，可检查额度并导入。' : '收藏列表为空，或没有支持的单条作品。');
         } catch (error) {
             this.options.log?.('favorite.read.failed', { platform, count: this.draft?.entries.length || 0, complete: this.draft?.complete === true }, error);
-            if (this.alive) this.status.setText(signal.aborted ? '读取已暂停，条目保留；请重新读取完整列表后导入。' : error instanceof Error ? error.message : '读取失败，请重新登录后重试');
+            if (this.alive) {
+                const count = this.draft?.entries.length || 0;
+                this.status.setText(signal.aborted
+                    ? '读取已暂停，条目保留；可导入已读取项，或重新读取完整列表。'
+                    : count
+                        ? `收藏读取未完成，已保留 ${count} 条，可导入已读取项或重新读取全部收藏。`
+                        : error instanceof Error ? error.message : '读取失败，请重新登录后重试');
+            }
         }
         finally { this.busy = false; if (this.alive) this.render(); }
     }
     private async submit(): Promise<void> {
-        if (this.busy || !this.draft?.complete || !this.store || !this.options.available(this.platform)) return;
+        if (this.busy || !this.draft || !this.store || !this.options.available(this.platform)) return;
         const draft = this.draft, store = this.store, entries = pendingFavoriteEntries(draft);
         const acceptedTaskIds = draft.entries.filter(entry => this.needsSync(entry)).flatMap(entry => entry.result?.taskId ? [entry.result.taskId] : []);
         if (!entries.length && !acceptedTaskIds.length) return;
@@ -228,7 +240,10 @@ export class FavoriteImportModal extends Modal {
                     await store.checkpointResult(draft, index);
                 }
             }
-            if (this.alive) this.status.setText(`${response.stopped || '本次导入完成'}。额度不足的部分未提交；未导入项可在补充额度后继续。${response.syncTriggered ? '已触发同步，云端完成后按现有平台设置补充本地素材。' : ''}`);
+            if (this.alive) {
+                const completed = draft.complete ? '本次导入完成' : '已导入已读取条目，收藏列表仍未读取完';
+                this.status.setText(`${response.stopped || completed}。额度不足的部分未提交；未导入项可在补充额度后继续。${response.syncTriggered ? '已触发同步，云端完成后按现有平台设置补充本地素材。' : ''}`);
+            }
         } catch (error) { if (this.alive) this.status.setText(error instanceof Error ? error.message : '导入已暂停，已提交结果保留'); }
         finally { this.busy = false; if (this.alive) this.render(); }
     }
