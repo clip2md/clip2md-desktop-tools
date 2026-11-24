@@ -633,9 +633,13 @@ export default class DesktopTools extends Plugin {
         const localStorageAuthorized = typeof (this.sessions as unknown as { hasLocalStorageAuthorization?: unknown }).hasLocalStorageAuthorization === "function" &&
             this.sessions.hasLocalStorageAuthorization(platform);
         const checked = await (async()=>{
+            if(platform==='youtube'||platform==='twitter')return readAccountProfile(this.sessions,platform,AbortSignal.any([signal,AbortSignal.timeout(platform==='youtube'?60000:15000)]));
+            // Douyin can keep a usable session in localStorage while its
+            // profile probe is blocked by the same verification page that
+            // blocks favorites. Let the favorites reader perform the
+            // page-level challenge check instead of timing out here.
             if (platform === 'douyin' && localStorageAuthorized)
                 return { state: 'authenticated', nickname: '抖音账号', sessionOnly: true } as const;
-            if(platform==='youtube'||platform==='twitter')return readAccountProfile(this.sessions,platform,AbortSignal.any([signal,AbortSignal.timeout(platform==='youtube'?60000:15000)]));
             return await this.sessions.cookieLoginProfile(platform) || await readAccountProfile(this.sessions,platform,AbortSignal.any([signal,AbortSignal.timeout(15000)]));
         })();
         signal.throwIfAborted();
